@@ -27,7 +27,6 @@
 Currently, updating multiple streams (e.g., "mark all orders as completed") requires:
 - N database roundtrips (one per stream)
 - Sequential processing or manual parallelization
-- No transaction guarantees across streams
 - Difficult error recovery in partial failures
 
 ### Proposed Solution
@@ -35,7 +34,6 @@ Currently, updating multiple streams (e.g., "mark all orders as completed") requ
 Implement a batch operations framework that:
 - Reduces database roundtrips through bulk operations
 - Provides parallel processing with controlled concurrency
-- Offers transaction-like semantics where possible
 - Handles partial failures gracefully
 - Maintains optimistic concurrency per stream
 
@@ -45,7 +43,6 @@ Implement a batch operations framework that:
 |-----------|---------|----------|-------------|
 | Update 100 streams | 100 roundtrips | 1-10 roundtrips | 90-99% reduction |
 | Parallel processing | Manual | Built-in | Developer experience |
-| Transaction support | None | Batch-level | Data consistency |
 | Error recovery | Manual | Automatic retry | Reliability |
 
 ---
@@ -82,24 +79,7 @@ var result = await repository.BatchReadAsync<Order>(
 );
 ```
 
-### UC-4: Cross-Aggregate Saga
-```csharp
-// Process payment and update order atomically
-await repository.BatchUpdateAsync(
-    new[]
-    {
-        (orderId, (Order o) => o.MarkAsPaid()),
-        (paymentId, (Payment p) => p.Complete())
-    },
-    compensatingActions: new[]
-    {
-        (orderId, (Order o) => o.Refund()),
-        (paymentId, (Payment p) => p.Reverse())
-    }
-);
-```
-
-### UC-5: Parallel Stream Creation
+### UC-4: Parallel Stream Creation
 ```csharp
 // Create 1000 orders from import file
 var commands = LoadOrdersFromFile();
@@ -119,12 +99,10 @@ await repository.BatchCreateAsync<Order>(
 - ✅ Has `AppendBatchAsync` for bulk writes
 - ✅ Uses `InsertManyAsync` with `IsOrdered = false`
 - ❌ No batch read support
-- ❌ No transaction support across collections
 
 **SQL Server** (`NStore.Persistence.MsSql`):
 - ❌ No batch operations
 - ⚠️ Could use table-valued parameters
-- ⚠️ Could use SQL transactions
 
 **TPL Batch Decorator** (`NStore.Tpl`):
 - ✅ Batches individual appends
@@ -134,10 +112,9 @@ await repository.BatchCreateAsync<Order>(
 ### Limitations
 
 1. **No Repository-Level Batching**: Current `Repository` works one aggregate at a time
-2. **No Transaction Support**: Cannot guarantee atomicity across streams
-3. **Manual Parallelization**: Developers must use `Parallel.ForEachAsync` manually
-4. **Limited Error Handling**: No built-in retry or compensation logic
-5. **No Batch Reads**: Must read streams individually
+2. **Manual Parallelization**: Developers must use `Parallel.ForEachAsync` manually
+3. **Limited Error Handling**: No built-in retry logic
+4. **No Batch Reads**: Must read streams individually
 
 ---
 
@@ -156,7 +133,6 @@ await repository.BatchCreateAsync<Order>(
 │  - BatchReadAsync<T>()                              │
 │  - BatchUpdateAsync<T>()                            │
 │  - BatchCreateAsync<T>()                            │
-│  - WithTransaction()                                │
 └─────────────────┬───────────────────────────────────┘
                   │
 ┌─────────────────▼───────────────────────────────────┐
@@ -181,6 +157,43 @@ await repository.BatchCreateAsync<Order>(
 2. **BatchOperationCoordinator**: Orchestrates parallel execution and error handling
 3. **IEnhancedPersistence**: Extended with batch read/update capabilities
 4. **BatchResult<T>**: Result type with success/failure details per item
+
+### Batch Operation Rules
+
+**Critical Constraints:**
+
+1. **Shared OperationId**: All streams in a single batch operation share the same `operationId`
+   - This enables idempotency across the entire batch
+   - Retry of a failed batch uses the same `operationId` for all streams
+   - Example: `"batch-complete-orders-2024-12-22-abc123"`
+
+2. **Single Operation Per Stream**: A batch can contain at most ONE operation per stream
+   - Each stream ID can appear only once in a batch
+   - Multiple operations on the same stream must be in separate batches
+   - This prevents conflicting concurrent updates to the same stream
+
+3. **Roundtrip Optimization**: The goal is to minimize database roundtrips
+   - Reading multiple streams: 1 query instead of N queries
+   - Writing multiple streams: Parallel execution with bulk operations where possible
+   - Expected: N roundtrips → 1-10 roundtrips (90-99% reduction)
+
+**Example - Valid Batch:**
+```csharp
+await repository.BatchUpdateAsync<Order>(
+    ["order-1", "order-2", "order-3"],  // Each stream appears once
+    order => order.MarkAsCompleted(),
+    operationId: "batch-complete-2024-12-22"  // Shared operationId
+);
+```
+
+**Example - Invalid Batch:**
+```csharp
+// ❌ INVALID: order-1 appears twice
+var operations = [
+    ("order-1", (Order o) => o.AddItem(...)),
+    ("order-1", (Order o) => o.UpdateStatus(...))  // ERROR: Duplicate stream
+];
+```
 
 ---
 
@@ -227,13 +240,6 @@ public interface IBatchRepository : IRepository
         BatchCreateOptions? options = null,
         CancellationToken cancellationToken = default)
         where T : IAggregate;
-
-    /// <summary>
-    /// Execute batch operation within a transaction scope (where supported)
-    /// </summary>
-    Task<BatchResult> WithTransactionAsync(
-        Func<IBatchRepository, Task<BatchResult>> operation,
-        CancellationToken cancellationToken = default);
 }
 
 /// <summary>
@@ -329,17 +335,6 @@ public sealed record BatchReadResult<T> where T : IAggregate
     public T? Aggregate { get; init; }
     public Exception? Error { get; init; }
     public bool IsSuccess => Error is null;
-}
-
-/// <summary>
-/// Non-generic batch result for transaction operations
-/// </summary>
-public sealed class BatchResult
-{
-    public required bool IsSuccess { get; init; }
-    public required int TotalOperations { get; init; }
-    public required TimeSpan Duration { get; init; }
-    public Exception? Error { get; init; }
 }
 ```
 
@@ -743,43 +738,6 @@ public sealed class BatchRepository : Repository, IBatchRepository
         };
     }
 
-    public async Task<BatchResult> WithTransactionAsync(
-        Func<IBatchRepository, Task<BatchResult>> operation,
-        CancellationToken cancellationToken = default)
-    {
-        // Transaction support varies by persistence backend
-        // For now, implement basic error handling and rollback tracking
-
-        var stopwatch = Stopwatch.StartNew();
-
-        try
-        {
-            var result = await operation(this).ConfigureAwait(false);
-            stopwatch.Stop();
-
-            return new BatchResult
-            {
-                IsSuccess = result.IsSuccess,
-                TotalOperations = result.TotalOperations,
-                Duration = stopwatch.Elapsed
-            };
-        }
-        catch (Exception ex)
-        {
-            stopwatch.Stop();
-
-            _logger?.LogError(ex, "Batch transaction failed");
-
-            return new BatchResult
-            {
-                IsSuccess = false,
-                TotalOperations = 0,
-                Duration = stopwatch.Elapsed,
-                Error = ex
-            };
-        }
-    }
-
     private static async IAsyncEnumerable<string> ProcessInParallel(
         List<string> ids,
         int maxParallelism)
@@ -833,7 +791,7 @@ public interface IBatchPersistence : IPersistence
         CancellationToken cancellationToken);
 
     /// <summary>
-    /// Append to multiple partitions with optional transaction support
+    /// Append to multiple partitions in parallel
     /// </summary>
     Task<IReadOnlyList<IChunk?>> AppendMultipleAsync(
         IEnumerable<(string PartitionId, long Index, object Payload, string OperationId)> operations,
@@ -1070,45 +1028,33 @@ public partial class MsSqlPersistence : IBatchPersistence
         var opList = operations.ToList();
         var results = new IChunk?[opList.Count];
 
-        // Use transaction for atomicity
         using var context = await _options.GetContextAsync(cancellationToken).ConfigureAwait(false);
-        using var transaction = context.Connection.BeginTransaction();
 
-        try
+        for (int i = 0; i < opList.Count; i++)
         {
-            for (int i = 0; i < opList.Count; i++)
+            var op = opList[i];
+            var bytes = _options.Serializer.Serialize(op.Payload, out string serializerInfo);
+
+            var sql = _options.GetInsertChunkSql();
+            using var command = context.CreateCommand(sql);
+
+            context.AddParam(command, "@PartitionId", op.PartitionId);
+            context.AddParam(command, "@Index", op.Index);
+            context.AddParam(command, "@OperationId", op.OperationId ?? Guid.NewGuid().ToString());
+            context.AddParam(command, "@Payload", bytes);
+            context.AddParam(command, "@SerializerInfo", serializerInfo);
+
+            var position = (long)await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+
+            results[i] = new SqlChunk
             {
-                var op = opList[i];
-                var bytes = _options.Serializer.Serialize(op.Payload, out string serializerInfo);
-
-                var sql = _options.GetInsertChunkSql();
-                using var command = context.CreateCommand(sql, transaction);
-
-                context.AddParam(command, "@PartitionId", op.PartitionId);
-                context.AddParam(command, "@Index", op.Index);
-                context.AddParam(command, "@OperationId", op.OperationId ?? Guid.NewGuid().ToString());
-                context.AddParam(command, "@Payload", bytes);
-                context.AddParam(command, "@SerializerInfo", serializerInfo);
-
-                var position = (long)await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-
-                results[i] = new SqlChunk
-                {
-                    Position = position,
-                    PartitionId = op.PartitionId,
-                    Index = op.Index,
-                    Payload = op.Payload,
-                    OperationId = op.OperationId,
-                    SerializerInfo = serializerInfo
-                };
-            }
-
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch
-        {
-            await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
-            throw;
+                Position = position,
+                PartitionId = op.PartitionId,
+                Index = op.Index,
+                Payload = op.Payload,
+                OperationId = op.OperationId,
+                SerializerInfo = serializerInfo
+            };
         }
 
         return results;
@@ -1201,43 +1147,6 @@ public sealed record RetryPolicy
         ConcurrencyException or
         TimeoutException or
         DbException { IsTransient: true };
-}
-```
-
-### Compensation Actions
-
-```csharp
-public sealed record CompensationAction<T> where T : IAggregate
-{
-    public required string AggregateId { get; init; }
-    public required Action<T> RollbackAction { get; init; }
-}
-
-// Usage:
-var compensations = new List<CompensationAction<Order>>();
-
-try
-{
-    await batchRepository.BatchUpdateAsync(orderIds,
-        order =>
-        {
-            compensations.Add(new CompensationAction<Order>
-            {
-                AggregateId = order.Id,
-                RollbackAction = o => o.Revert()
-            });
-            order.Complete();
-        },
-        operationId
-    );
-}
-catch
-{
-    // Rollback all successful operations
-    foreach (var compensation in compensations)
-    {
-        await ApplyCompensation(compensation);
-    }
 }
 ```
 
@@ -1394,11 +1303,9 @@ Expected performance improvements:
 
 ## Future Enhancements
 
-1. **Distributed Transactions**: Add support for two-phase commit across persistence backends
-2. **Saga Orchestration**: Built-in saga pattern support with compensation
-3. **Event Streaming**: Real-time event streaming from batch operations
-4. **Metrics & Telemetry**: OpenTelemetry integration for observability
-5. **GraphQL Support**: Batch operations via GraphQL DataLoader pattern
+1. **Event Streaming**: Real-time event streaming from batch operations
+2. **Metrics & Telemetry**: OpenTelemetry integration for observability
+3. **GraphQL Support**: Batch operations via GraphQL DataLoader pattern
 
 ---
 
