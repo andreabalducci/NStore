@@ -70,16 +70,7 @@ await repository.BatchUpdateAsync<Reservation>(
 );
 ```
 
-### UC-3: Batch Read with Aggregation
-```csharp
-// Calculate total sales across all orders
-var result = await repository.BatchReadAsync<Order>(
-    orderIds,
-    aggregator: (orders) => orders.Sum(o => o.TotalAmount)
-);
-```
-
-### UC-4: Parallel Stream Creation
+### UC-3: Parallel Stream Creation
 ```csharp
 // Create 1000 orders from import file
 var commands = LoadOrdersFromFile();
@@ -775,16 +766,7 @@ namespace NStore.Core.Persistence;
 public interface IBatchPersistence : IPersistence
 {
     /// <summary>
-    /// Read multiple partitions in a single roundtrip (where supported)
-    /// </summary>
-    IAsyncEnumerable<IChunk> ReadMultipleForwardAsync(
-        IEnumerable<string> partitionIds,
-        long fromLowerIndexInclusive,
-        long toUpperIndexInclusive,
-        CancellationToken cancellationToken);
-
-    /// <summary>
-    /// Read last chunk from multiple partitions efficiently
+    /// Read last chunk from multiple partitions efficiently (for batch updates)
     /// </summary>
     Task<IReadOnlyDictionary<string, IChunk?>> ReadMultipleLastAsync(
         IEnumerable<string> partitionIds,
@@ -807,40 +789,6 @@ namespace NStore.Persistence.Mongo;
 public partial class MongoPersistence<TChunk> : IBatchPersistence
     where TChunk : IMongoChunk, new()
 {
-    public async IAsyncEnumerable<IChunk> ReadMultipleForwardAsync(
-        IEnumerable<string> partitionIds,
-        long fromLowerIndexInclusive,
-        long toUpperIndexInclusive,
-        [EnumeratorCancellation] CancellationToken cancellationToken)
-    {
-        var idList = partitionIds.ToList();
-
-        var filter = Builders<TChunk>.Filter.And(
-            Builders<TChunk>.Filter.In(x => x.PartitionId, idList),
-            Builders<TChunk>.Filter.Gte(x => x.Index, fromLowerIndexInclusive),
-            Builders<TChunk>.Filter.Lte(x => x.Index, toUpperIndexInclusive)
-        );
-
-        var sort = Builders<TChunk>.Sort
-            .Ascending(x => x.PartitionId)
-            .Ascending(x => x.Index);
-
-        var options = new FindOptions<TChunk> { Sort = sort };
-
-        using var cursor = await _chunks
-            .FindAsync(filter, options, cancellationToken)
-            .ConfigureAwait(false);
-
-        while (await cursor.MoveNextAsync(cancellationToken).ConfigureAwait(false))
-        {
-            foreach (var chunk in cursor.Current)
-            {
-                _mongoPayloadSerializer.ApplyDeserialization(chunk);
-                yield return chunk;
-            }
-        }
-    }
-
     public async Task<IReadOnlyDictionary<string, IChunk?>> ReadMultipleLastAsync(
         IEnumerable<string> partitionIds,
         CancellationToken cancellationToken)
@@ -948,38 +896,6 @@ namespace NStore.Persistence.MsSql;
 
 public partial class MsSqlPersistence : IBatchPersistence
 {
-    public async IAsyncEnumerable<IChunk> ReadMultipleForwardAsync(
-        IEnumerable<string> partitionIds,
-        long fromLowerIndexInclusive,
-        long toUpperIndexInclusive,
-        [EnumeratorCancellation] CancellationToken cancellationToken)
-    {
-        var idList = partitionIds.ToList();
-
-        // Use table-valued parameter for efficient IN clause
-        var sql = $@"
-            SELECT [Position], [PartitionId], [Index], [Payload], [OperationId], [SerializerInfo]
-            FROM {_options.StreamsTableName}
-            WHERE [PartitionId] IN (SELECT value FROM STRING_SPLIT(@PartitionIds, ','))
-              AND [Index] >= @FromIndex
-              AND [Index] <= @ToIndex
-            ORDER BY [PartitionId], [Index]";
-
-        using var context = await _options.GetContextAsync(cancellationToken).ConfigureAwait(false);
-        using var command = context.CreateCommand(sql);
-
-        context.AddParam(command, "@PartitionIds", string.Join(",", idList));
-        context.AddParam(command, "@FromIndex", fromLowerIndexInclusive);
-        context.AddParam(command, "@ToIndex", toUpperIndexInclusive);
-
-        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-
-        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-        {
-            yield return ReadChunk(reader);
-        }
-    }
-
     public async Task<IReadOnlyDictionary<string, IChunk?>> ReadMultipleLastAsync(
         IEnumerable<string> partitionIds,
         CancellationToken cancellationToken)
