@@ -66,8 +66,8 @@ namespace NStore.Core.Streams
         public async Task<bool> IsEmpty(CancellationToken cancellationToken)
         {
             // @@REVIEW: check version to avoid db roundtrip
-            return await Persistence.ReadSingleBackwardAsync(Id, cancellationToken)
-                       .ConfigureAwait(false) != null;
+            return (await Persistence.ReadSingleBackwardAsync(Id, cancellationToken)
+                       .ConfigureAwait(false)) != null;
         }
 
         public async Task<bool> ContainsOperationAsync(
