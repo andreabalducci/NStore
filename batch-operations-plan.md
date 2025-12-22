@@ -59,18 +59,7 @@ await repository.BatchUpdateAsync<Order>(
 );
 ```
 
-### UC-2: Conditional Batch Operations
-```csharp
-// Cancel all reservations older than 30 minutes
-var expiredIds = await FindExpiredReservations();
-await repository.BatchUpdateAsync<Reservation>(
-    expiredIds,
-    reservation => reservation.Cancel("Expired"),
-    predicate: r => r.Status == ReservationStatus.Pending
-);
-```
-
-### UC-3: Parallel Stream Creation
+### UC-2: Parallel Stream Creation
 ```csharp
 // Create 1000 orders from import file
 var commands = LoadOrdersFromFile();
@@ -253,7 +242,6 @@ public sealed record BatchUpdateOptions
     public TimeSpan RetryDelay { get; init; } = TimeSpan.FromMilliseconds(100);
     public bool StopOnFirstError { get; init; } = false;
     public bool UseOptimisticConcurrency { get; init; } = true;
-    public Predicate<IAggregate>? Predicate { get; init; }
 }
 
 /// <summary>
