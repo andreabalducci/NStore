@@ -1,6 +1,8 @@
 ﻿using System;
+using System.IO;
 using System.Reflection;
 using System.Threading;
+using Microsoft.Extensions.Configuration;
 using MongoDB.Bson.Serialization;
 using MongoDB.Bson.Serialization.Serializers;
 using MongoDB.Driver;
@@ -20,6 +22,22 @@ namespace NStore.Persistence.Tests
 {
     public partial class BasePersistenceTest
     {
+        private const string MongoConnectionEnvVar = "NSTORE_MONGODB";
+        private const string MongoPerfEnabledEnvVar = "NSTORE_MONGO_BATCH_PERF";
+        private static readonly string[] PerfMongoConnectionConfigKeys =
+        {
+            "NStore:Mongo:Performance:ConnectionString",
+            "NStore:Mongo:Performance:AtlasConnectionString"
+        };
+
+        private static readonly string[] MongoConnectionConfigKeys =
+        {
+            "NStore:Mongo:ConnectionString"
+        };
+
+        protected static readonly Lazy<IConfigurationRoot> TestConfiguration =
+            new Lazy<IConfigurationRoot>(BuildConfiguration);
+
         protected string _mongoConnectionString;
         protected IMongoPersistence _mongoPersistence;
         private MongoPersistenceOptions _options;
@@ -75,13 +93,89 @@ namespace NStore.Persistence.Tests
 
         private static string GetPartitionsConnectionString()
         {
-            var mongo = Environment.GetEnvironmentVariable("NSTORE_MONGODB");
-            if (string.IsNullOrWhiteSpace(mongo))
+            var mongo = Environment.GetEnvironmentVariable(MongoConnectionEnvVar);
+            if (!string.IsNullOrWhiteSpace(mongo))
             {
-                throw new TestMisconfiguredException("NSTORE_MONGODB environment variable not set");
+                return mongo;
             }
 
-            return mongo;
+            var config = TestConfiguration.Value;
+            if (IsEnabled(Environment.GetEnvironmentVariable(MongoPerfEnabledEnvVar)))
+            {
+                var perfMongo = ReadFirstConfiguredValue(config, PerfMongoConnectionConfigKeys);
+                if (!string.IsNullOrWhiteSpace(perfMongo))
+                {
+                    return perfMongo;
+                }
+            }
+
+            mongo = ReadFirstConfiguredValue(config, MongoConnectionConfigKeys);
+            if (!string.IsNullOrWhiteSpace(mongo))
+            {
+                return mongo;
+            }
+
+            throw new TestMisconfiguredException(
+                $"Mongo connection string not set. Configure {MongoConnectionEnvVar} or appsettings/user-secrets keys: {string.Join(", ", PerfMongoConnectionConfigKeys)} or {string.Join(", ", MongoConnectionConfigKeys)}.");
+        }
+
+        private static string ReadFirstConfiguredValue(IConfiguration config, string[] keys)
+        {
+            for (var i = 0; i < keys.Length; i++)
+            {
+                var value = config[keys[i]];
+                if (!string.IsNullOrWhiteSpace(value))
+                {
+                    return value;
+                }
+            }
+
+            return null;
+        }
+
+        private static bool IsEnabled(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return false;
+            }
+
+            return value == "1" ||
+                   value.Equals("true", StringComparison.OrdinalIgnoreCase) ||
+                   value.Equals("yes", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string FindAppSettingsBasePath()
+        {
+            var current = new DirectoryInfo(AppContext.BaseDirectory);
+            while (current != null)
+            {
+                var appsettingsPath = Path.Combine(current.FullName, "appsettings.json");
+                if (File.Exists(appsettingsPath))
+                {
+                    return current.FullName;
+                }
+
+                current = current.Parent;
+            }
+
+            return AppContext.BaseDirectory;
+        }
+
+        private static IConfigurationRoot BuildConfiguration()
+        {
+            var basePath = FindAppSettingsBasePath();
+            return new ConfigurationBuilder()
+                .SetBasePath(basePath)
+                .AddJsonFile("appsettings.json", optional: true, reloadOnChange: false)
+                .AddJsonFile("appsettings.Local.json", optional: true, reloadOnChange: false)
+                .AddUserSecrets(typeof(BasePersistenceTest).Assembly, optional: true)
+                .Build();
+        }
+
+        protected static IConfigurationRoot GetTestConfiguration()
+        {
+            return TestConfiguration.Value;
         }
 
         protected IMongoCollection<TChunk> GetCollection<TChunk>()
