@@ -77,12 +77,28 @@ Main perf test:
 
 - `mongodb_batch_insert_performance_tests.should_measure_batch_insert_performance_degradation`
 
-Enable and run perf suite:
+Run only the perf benchmark test:
 
 ```bash
 NSTORE_MONGO_BATCH_PERF=1 \
 dotnet test src/NStore.Persistence.Mongo.Tests/NStore.Persistence.Mongo.Tests.csproj -c Release -f net10.0 \
   --filter "FullyQualifiedName~mongodb_batch_insert_performance_tests.should_measure_batch_insert_performance_degradation"
+```
+
+Run perf benchmark on Atlas/user-secrets perf connection string (ignores `NSTORE_MONGODB` if it is set in your shell):
+
+```bash
+env -u NSTORE_MONGODB \
+NSTORE_MONGO_BATCH_PERF=1 \
+dotnet test src/NStore.Persistence.Mongo.Tests/NStore.Persistence.Mongo.Tests.csproj -c Release -f net10.0 \
+  --filter "FullyQualifiedName~mongodb_batch_insert_performance_tests.should_measure_batch_insert_performance_degradation"
+```
+
+Run the normal suite without perf tests:
+
+```bash
+dotnet test src/NStore.Persistence.Mongo.Tests/NStore.Persistence.Mongo.Tests.csproj -c Release -f net10.0 \
+  --filter "Category!=Performance"
 ```
 
 ### Scenarios
@@ -119,6 +135,7 @@ The suite waits 5 seconds between scenarios to reduce transient server/oplog pre
 Use `NSTORE_MONGO_BATCH_PERF_SCENARIO` with one or more comma-separated names:
 
 ```bash
+env -u NSTORE_MONGODB \
 NSTORE_MONGO_BATCH_PERF=1 \
 NSTORE_MONGO_BATCH_PERF_SCENARIO='batch-25-writers-unbounded-chunks-1000' \
 dotnet test src/NStore.Persistence.Mongo.Tests/NStore.Persistence.Mongo.Tests.csproj -c Release -f net10.0 \
@@ -133,7 +150,7 @@ dotnet test src/NStore.Persistence.Mongo.Tests/NStore.Persistence.Mongo.Tests.cs
 - `NSTORE_MONGO_BATCH_PERF_PARTITIONS=<int>` partition count (default `100`)
 - `NSTORE_MONGO_BATCH_PERF_WARMUP=<int>` warmup batches (default `3`)
 - `NSTORE_MONGO_BATCH_PERF_PROGRESS_EVERY_BATCHES=<int>` progress interval override
-- `NSTORE_MONGO_BATCH_PERF_MAX_DEGRADATION=<double>` optional assertion threshold
+- `NSTORE_MONGO_BATCH_PERF_MAX_DEGRADATION=<double>` optional assertion threshold (`>= 1.0`, where `1.0` = no degradation allowed)
 
 When no config scenarios are found, env fallback is used:
 

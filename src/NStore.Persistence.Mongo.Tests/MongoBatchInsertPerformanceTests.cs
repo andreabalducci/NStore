@@ -247,6 +247,8 @@ namespace NStore.Persistence.Mongo.Tests
             Console.WriteLine($"Mongo batch scenario target: {mongoTargetUrl}");
 
             var persistence = Create(true);
+            CancellationTokenSource workerCancellation = null;
+            Task workersCompletionTask = Task.CompletedTask;
             try
             {
                 if (!(persistence is IEnhancedPersistence batcher))
@@ -294,12 +296,14 @@ namespace NStore.Persistence.Mongo.Tests
 
                 long nextBatchNumber = 0;
                 var nextPayloadId = nextId;
+                workerCancellation = new CancellationTokenSource();
+                var workerCancellationToken = workerCancellation.Token;
 
                 var workerTasks = writerStates
                     .Select(writerState =>
                         Task.Run(async () =>
                         {
-                            while (true)
+                            while (!workerCancellationToken.IsCancellationRequested)
                             {
                                 var batchNumber = Interlocked.Increment(ref nextBatchNumber);
                                 if (batchNumber > totalBatches)
@@ -313,7 +317,7 @@ namespace NStore.Persistence.Mongo.Tests
                                 var jobs = CreateJobs(startId, currentBatchSize, writerState);
 
                                 var batchStopwatch = Stopwatch.StartNew();
-                                await batcher.AppendBatchAsync(jobs, CancellationToken.None).ConfigureAwait(false);
+                                await batcher.AppendBatchAsync(jobs, workerCancellationToken).ConfigureAwait(false);
                                 batchStopwatch.Stop();
                                 Assert.All(jobs, job => Assert.Equal(WriteJob.WriteResult.Committed, job.Result));
 
@@ -321,13 +325,13 @@ namespace NStore.Persistence.Mongo.Tests
                                         new batch_execution_result(
                                             currentBatchSize,
                                             batchStopwatch.Elapsed.TotalMilliseconds),
-                                        CancellationToken.None)
+                                        workerCancellationToken)
                                     .ConfigureAwait(false);
                             }
-                        }))
+                        }, workerCancellationToken))
                     .ToArray();
 
-                var workersCompletionTask = Task.Run(async () =>
+                workersCompletionTask = Task.Run(async () =>
                 {
                     Exception completionError = null;
                     try
@@ -336,7 +340,10 @@ namespace NStore.Persistence.Mongo.Tests
                     }
                     catch (Exception ex)
                     {
-                        completionError = ex;
+                        if (!IsCancellationException(ex) || !workerCancellationToken.IsCancellationRequested)
+                        {
+                            completionError = ex;
+                        }
                     }
                     finally
                     {
@@ -455,6 +462,14 @@ namespace NStore.Persistence.Mongo.Tests
             }
             finally
             {
+                if (workerCancellation != null)
+                {
+                    workerCancellation.Cancel();
+                }
+
+                await workersCompletionTask.ConfigureAwait(false);
+                workerCancellation?.Dispose();
+
                 if (persistence is IDisposable disposablePersistence)
                 {
                     disposablePersistence.Dispose();
@@ -677,6 +692,24 @@ namespace NStore.Persistence.Mongo.Tests
             }
         }
 
+        private static bool IsCancellationException(Exception exception)
+        {
+            if (exception is OperationCanceledException)
+            {
+                return true;
+            }
+
+            if (exception is AggregateException aggregateException)
+            {
+                return aggregateException
+                    .Flatten()
+                    .InnerExceptions
+                    .All(x => x is OperationCanceledException);
+            }
+
+            return false;
+        }
+
         private static string ResolveSuiteLogFilePath(string configuredPath)
         {
             if (!string.IsNullOrWhiteSpace(configuredPath))
@@ -739,7 +772,10 @@ namespace NStore.Persistence.Mongo.Tests
                 return string.Empty;
             }
 
-            if (!value.Contains(",") && !value.Contains("\""))
+            if (!value.Contains(",") &&
+                !value.Contains("\"") &&
+                !value.Contains('\n') &&
+                !value.Contains('\r'))
             {
                 return value;
             }
@@ -1076,11 +1112,11 @@ namespace NStore.Persistence.Mongo.Tests
                     $"{variable} must be a floating-point value, but was '{raw}'.");
             }
 
-            if (value <= 0)
+            if (value < 1.0)
             {
                 throw new ArgumentOutOfRangeException(
                     variable,
-                    $"{variable} must be > 0, but was {value}.");
+                    $"{variable} must be >= 1.0 (1.0 = no degradation), but was {value}.");
             }
 
             return value;
