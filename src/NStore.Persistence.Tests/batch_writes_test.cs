@@ -107,15 +107,47 @@ namespace NStore.Persistence.Tests
                 return;
 
             using var cts = new CancellationTokenSource(10_000);
-            using var batcher = new PersistenceBatchAppendDecorator(_persistence, _logger, 512, 10);
+            await using var batcher = new PersistenceBatchAppendDecorator(_persistence, _logger, 512, 10);
             //            batcher.Cancel(10_000);
 
             await batcher.AppendAsync("a", 1, "first", null, cts.Token);
             //            await Assert.ThrowsAsync<DuplicateStreamIndexException>(() => batcher.AppendAsync("a", 1, "fail here"));
 
-            var lastPos = await Store.ReadLastPositionAsync();
+            var lastPos = await Store.ReadLastPositionAsync(cancellationToken: cts.Token);
 
             Assert.Equal(1, lastPos);
+        }
+
+        [Fact]
+        public async Task should_add_many_with_parallel_batch_extension()
+        {
+            if (Batcher == null)
+                return;
+
+            var jobs = Enumerable.Range(0, 200)
+                .Select(i => new WriteJob(
+                    partitionId: $"p{i % 5}",
+                    index: i / 5 + 1,
+                    payload: $"payload-{i}",
+                    operationId: $"op-{i}"))
+                .ToArray();
+
+            var options = new ParallelBatchAppendOptions
+            {
+                BatchSize = 17,
+                MaxWriters = 4,
+            };
+
+            await Batcher.AppendBatchAsync(jobs, options, CancellationToken.None).ConfigureAwait(false);
+
+            Assert.All(jobs, job =>
+            {
+                Assert.Equal(WriteJob.WriteResult.Committed, job.Result);
+                Assert.NotEqual(0, job.Position);
+            });
+
+            var lastPosition = await Store.ReadLastPositionAsync(CancellationToken.None).ConfigureAwait(false);
+            Assert.Equal(jobs.Length, lastPosition);
         }
     }
 }

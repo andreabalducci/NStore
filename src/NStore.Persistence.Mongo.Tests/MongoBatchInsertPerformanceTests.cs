@@ -30,6 +30,9 @@ namespace NStore.Persistence.Mongo.Tests
         private const string MaxDegradationVar = "NSTORE_MONGO_BATCH_PERF_MAX_DEGRADATION";
         private const string ScenarioFilterVar = "NSTORE_MONGO_BATCH_PERF_SCENARIO";
         private const string LogFileVar = "NSTORE_MONGO_BATCH_PERF_LOG_FILE";
+        private const string AppendModeVar = "NSTORE_MONGO_BATCH_PERF_APPEND_MODE";
+        private const string ParallelBatchSizeVar = "NSTORE_MONGO_BATCH_PERF_PARALLEL_BATCH_SIZE";
+        private const string ParallelWritersVar = "NSTORE_MONGO_BATCH_PERF_PARALLEL_WRITERS";
         private const string PerformanceProfilesConfigPath = "NStore:Mongo:Performance:TestParameters";
         private const string MongoConnectionEnvVar = "NSTORE_MONGODB";
         private const int InterScenarioDelaySeconds = 5;
@@ -218,12 +221,18 @@ namespace NStore.Persistence.Mongo.Tests
                 scenario.Writers,
                 totalBatches,
                 partitionCount);
+            var appendMode = ReadAppendModeSetting(AppendModeVar);
+            var parallelBatchSize = ReadOptionalIntSetting(ParallelBatchSizeVar, 1) ?? scenario.BatchSize;
+            var parallelWriters = ReadOptionalIntSetting(ParallelWritersVar, 1) ?? effectiveWriterCount;
             var progressEveryBatches = configuredProgressEveryBatches.HasValue
                 ? configuredProgressEveryBatches.Value
                 : Math.Max(1L, totalBatches / 20);
             progressEveryBatches = Math.Min(progressEveryBatches, totalBatches);
             var representativePayloadSizeBytes = EstimatePayloadSizeBytes(
                 CreateComplexPayload(1, "perf-stream-0000", 1));
+            var appendModeLabel = appendMode == append_mode.parallel_extension
+                ? $"parallel-extension(parallel_batch_size={parallelBatchSize},parallel_writers={parallelWriters})"
+                : "baseline";
 
             var logDirectory = Path.GetDirectoryName(logFile);
             if (!string.IsNullOrWhiteSpace(logDirectory))
@@ -235,13 +244,13 @@ namespace NStore.Persistence.Mongo.Tests
             await writer.WriteLineAsync($"# mongodb_url={mongoTargetUrl}");
             await writer.WriteLineAsync($"# started_utc={DateTimeOffset.UtcNow:O}");
             await writer.WriteLineAsync(
-                $"# scenario={scenario.Name},total_chunks={scenario.TotalChunks},batch_size={scenario.BatchSize},writers={FormatWriters(scenario.Writers)},effective_writers={effectiveWriterCount},partitions={partitionCount},total_batches={totalBatches},warmup_batches={warmupBatches},progress_every_batches={progressEveryBatches}");
+                $"# scenario={scenario.Name},append_mode={appendModeLabel},total_chunks={scenario.TotalChunks},batch_size={scenario.BatchSize},writers={FormatWriters(scenario.Writers)},effective_writers={effectiveWriterCount},partitions={partitionCount},total_batches={totalBatches},warmup_batches={warmupBatches},progress_every_batches={progressEveryBatches}");
             await writer.WriteLineAsync(
                 "timestamp_utc,batch,inserted_total,total_chunks,progress_pct,window_batches,window_avg_batch_ms,window_p95_batch_ms,window_throughput_items_per_sec,total_elapsed_s,degradation_x,last_position");
             await writer.FlushAsync();
 
             _output.WriteLine(
-                $"Mongo batch scenario: name={scenario.Name}, totalChunks={scenario.TotalChunks}, batchSize={scenario.BatchSize}, writers={FormatWriters(scenario.Writers)}, effectiveWriters={effectiveWriterCount}, partitions={partitionCount}, totalBatches={totalBatches}, warmup={warmupBatches}, progressEveryBatches={progressEveryBatches}.");
+                $"Mongo batch scenario: name={scenario.Name}, appendMode={appendModeLabel}, totalChunks={scenario.TotalChunks}, batchSize={scenario.BatchSize}, writers={FormatWriters(scenario.Writers)}, effectiveWriters={effectiveWriterCount}, partitions={partitionCount}, totalBatches={totalBatches}, warmup={warmupBatches}, progressEveryBatches={progressEveryBatches}.");
             _output.WriteLine($"Mongo batch scenario target: {mongoTargetUrl}");
             _output.WriteLine($"Mongo batch scenario log: {logFile}");
             Console.WriteLine($"Mongo batch scenario target: {mongoTargetUrl}");
@@ -256,6 +265,22 @@ namespace NStore.Persistence.Mongo.Tests
                     throw new InvalidOperationException("Persistence does not expose AppendBatchAsync.");
                 }
 
+                var parallelAppendOptions = new ParallelBatchAppendOptions
+                {
+                    BatchSize = parallelBatchSize,
+                    MaxWriters = parallelWriters
+                };
+
+                Task AppendJobsAsync(WriteJob[] jobs, CancellationToken ct)
+                {
+                    if (appendMode == append_mode.parallel_extension)
+                    {
+                        return batcher.AppendBatchAsync(jobs, parallelAppendOptions, ct);
+                    }
+
+                    return batcher.AppendBatchAsync(jobs, ct);
+                }
+
                 var writerStates = CreateWriterStates(effectiveWriterCount, partitionCount);
                 long nextId = 0;
                 long warmupInserted = 0;
@@ -266,7 +291,7 @@ namespace NStore.Persistence.Mongo.Tests
                     nextId += scenario.BatchSize;
                     warmupInserted += scenario.BatchSize;
 
-                    await batcher.AppendBatchAsync(warmupJobs, CancellationToken.None).ConfigureAwait(false);
+                    await AppendJobsAsync(warmupJobs, CancellationToken.None).ConfigureAwait(false);
                     Assert.All(warmupJobs, job => Assert.Equal(WriteJob.WriteResult.Committed, job.Result));
                 }
 
@@ -317,7 +342,7 @@ namespace NStore.Persistence.Mongo.Tests
                                 var jobs = CreateJobs(startId, currentBatchSize, writerState);
 
                                 var batchStopwatch = Stopwatch.StartNew();
-                                await batcher.AppendBatchAsync(jobs, workerCancellationToken).ConfigureAwait(false);
+                                await AppendJobsAsync(jobs, workerCancellationToken).ConfigureAwait(false);
                                 batchStopwatch.Stop();
                                 Assert.All(jobs, job => Assert.Equal(WriteJob.WriteResult.Committed, job.Result));
 
@@ -1132,6 +1157,37 @@ namespace NStore.Persistence.Mongo.Tests
             return value == "1" ||
                    value.Equals("true", StringComparison.OrdinalIgnoreCase) ||
                    value.Equals("yes", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static append_mode ReadAppendModeSetting(string variable)
+        {
+            var raw = Environment.GetEnvironmentVariable(variable);
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                return append_mode.baseline;
+            }
+
+            if (raw.Equals("baseline", StringComparison.OrdinalIgnoreCase) ||
+                raw.Equals("default", StringComparison.OrdinalIgnoreCase))
+            {
+                return append_mode.baseline;
+            }
+
+            if (raw.Equals("parallel", StringComparison.OrdinalIgnoreCase) ||
+                raw.Equals("parallel-extension", StringComparison.OrdinalIgnoreCase) ||
+                raw.Equals("extension", StringComparison.OrdinalIgnoreCase))
+            {
+                return append_mode.parallel_extension;
+            }
+
+            throw new ArgumentException(
+                $"{variable} must be one of: baseline, default, parallel, parallel-extension, extension. Value: '{raw}'.");
+        }
+
+        private enum append_mode
+        {
+            baseline,
+            parallel_extension
         }
 
         private sealed class perf_test_configuration
