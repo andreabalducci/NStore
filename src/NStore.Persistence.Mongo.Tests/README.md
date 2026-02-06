@@ -25,6 +25,21 @@ Config sources loaded by tests:
 - optional `appsettings.Local.json`
 - user secrets (`UserSecretsId: nstore-persistence-mongo-tests`)
 
+## Durable Writes (Flush Guarantees)
+
+To require server-side durability acknowledgements for benchmark writes, include write concern
+and journaling settings in the connection string:
+
+- local standalone MongoDB: `w=1&journal=true&wtimeoutMS=30000`
+- replica set / Atlas: `w=majority&journal=true&wtimeoutMS=30000`
+
+Example local user secret:
+
+```bash
+dotnet user-secrets --project src/NStore.Persistence.Mongo.Tests/NStore.Persistence.Mongo.Tests.csproj \
+  set "NStore:Mongo:ConnectionString" "mongodb://localhost:27017/nstoredev?w=1&journal=true&wtimeoutMS=30000"
+```
+
 ## Local Mongo Setup
 
 Start local MongoDB:
@@ -36,7 +51,7 @@ docker run --name nstore-mongo -p 27017:27017 -d mongo:7
 Run all Mongo tests against local MongoDB:
 
 ```bash
-NSTORE_MONGODB='mongodb://localhost:27017/nstoredev' \
+NSTORE_MONGODB='mongodb://localhost:27017/nstoredev?w=1&journal=true&wtimeoutMS=30000' \
 dotnet test src/NStore.Persistence.Mongo.Tests/NStore.Persistence.Mongo.Tests.csproj -c Release -f net10.0
 ```
 
@@ -46,14 +61,14 @@ Store connection string in user secrets:
 
 ```bash
 dotnet user-secrets --project src/NStore.Persistence.Mongo.Tests/NStore.Persistence.Mongo.Tests.csproj \
-  set "NStore:Mongo:Performance:ConnectionString" "mongodb+srv://<user>:<password>@<cluster>/<db>?authSource=admin"
+  set "NStore:Mongo:Performance:ConnectionString" "mongodb+srv://<user>:<password>@<cluster>/<db>?authSource=admin&w=majority&journal=true&wtimeoutMS=30000"
 ```
 
 You can also set:
 
 ```bash
 dotnet user-secrets --project src/NStore.Persistence.Mongo.Tests/NStore.Persistence.Mongo.Tests.csproj \
-  set "NStore:Mongo:Performance:AtlasConnectionString" "mongodb+srv://<user>:<password>@<cluster>/<db>?authSource=admin"
+  set "NStore:Mongo:Performance:AtlasConnectionString" "mongodb+srv://<user>:<password>@<cluster>/<db>?authSource=admin&w=majority&journal=true&wtimeoutMS=30000"
 ```
 
 ## Performance Benchmark

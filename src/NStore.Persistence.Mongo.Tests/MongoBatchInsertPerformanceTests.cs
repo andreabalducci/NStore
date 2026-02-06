@@ -5,6 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
 using MongoDB.Bson;
@@ -182,7 +183,6 @@ namespace NStore.Persistence.Mongo.Tests
                 scenario.Writers,
                 totalBatches,
                 partitionCount);
-            var unboundedWriters = scenario.Writers <= 0;
             var progressEveryBatches = configuredProgressEveryBatches ?? Math.Max(1, totalBatches / 20);
             progressEveryBatches = Math.Min(progressEveryBatches, totalBatches);
 
@@ -207,7 +207,6 @@ namespace NStore.Persistence.Mongo.Tests
             var persistence = Create(true);
             try
             {
-                var store = new LogDecorator(persistence, LoggerFactory);
                 if (!(persistence is IEnhancedPersistence batcher))
                 {
                     throw new InvalidOperationException("Persistence does not expose AppendBatchAsync.");
@@ -215,11 +214,13 @@ namespace NStore.Persistence.Mongo.Tests
 
                 var writerStates = CreateWriterStates(effectiveWriterCount, partitionCount);
                 long nextId = 0;
+                long warmupInserted = 0;
                 for (var i = 0; i < warmupBatches; i++)
                 {
                     var writerState = writerStates[i % effectiveWriterCount];
                     var warmupJobs = CreateJobs(nextId, scenario.BatchSize, writerState);
                     nextId += scenario.BatchSize;
+                    warmupInserted += scenario.BatchSize;
 
                     await batcher.AppendBatchAsync(warmupJobs, CancellationToken.None).ConfigureAwait(false);
                     Assert.All(warmupJobs, job => Assert.Equal(WriteJob.WriteResult.Committed, job.Result));
@@ -237,95 +238,127 @@ namespace NStore.Persistence.Mongo.Tests
                 double worstDegradation = 0;
                 double lastDegradation = 0;
 
-                var nextBatchNumber = 1;
-                while (nextBatchNumber <= totalBatches)
+                var batchResults = Channel.CreateBounded<batch_execution_result>(new BoundedChannelOptions(Math.Max(64, effectiveWriterCount * 4))
                 {
-                    var remainingForWave = scenario.TotalChunks - insertedTotal;
-                    var waveSizeLimit = unboundedWriters
-                        ? totalBatches
-                        : effectiveWriterCount;
-                    var wave = new List<(int BatchNumber, int BatchSize, WriteJob[] Jobs)>(waveSizeLimit);
+                    SingleReader = true,
+                    SingleWriter = false,
+                    FullMode = BoundedChannelFullMode.Wait,
+                    AllowSynchronousContinuations = false
+                });
 
-                    for (var slot = 0; slot < waveSizeLimit && nextBatchNumber <= totalBatches && remainingForWave > 0; slot++)
+                var nextBatchNumber = 0;
+                var nextPayloadId = nextId;
+
+                var workerTasks = writerStates
+                    .Select(writerState =>
+                        Task.Run(async () =>
+                        {
+                            while (true)
+                            {
+                                var batchNumber = Interlocked.Increment(ref nextBatchNumber);
+                                if (batchNumber > totalBatches)
+                                {
+                                    break;
+                                }
+
+                                var remainingForBatch = scenario.TotalChunks - (long)(batchNumber - 1) * scenario.BatchSize;
+                                var currentBatchSize = (int)Math.Min(remainingForBatch, scenario.BatchSize);
+                                var payloadSizes = new List<int>(currentBatchSize);
+                                var startId = Interlocked.Add(ref nextPayloadId, currentBatchSize) - currentBatchSize;
+                                var jobs = CreateJobs(startId, currentBatchSize, writerState, payloadSizes);
+
+                                var batchStopwatch = Stopwatch.StartNew();
+                                await batcher.AppendBatchAsync(jobs, CancellationToken.None).ConfigureAwait(false);
+                                batchStopwatch.Stop();
+                                Assert.All(jobs, job => Assert.Equal(WriteJob.WriteResult.Committed, job.Result));
+
+                                await batchResults.Writer.WriteAsync(
+                                        new batch_execution_result(
+                                            currentBatchSize,
+                                            batchStopwatch.Elapsed.TotalMilliseconds,
+                                            payloadSizes),
+                                        CancellationToken.None)
+                                    .ConfigureAwait(false);
+                            }
+                        }))
+                    .ToArray();
+
+                var workersCompletionTask = Task.Run(async () =>
+                {
+                    Exception completionError = null;
+                    try
                     {
-                        var currentBatchSize = (int)Math.Min(remainingForWave, scenario.BatchSize);
-                        var writerState = writerStates[(nextBatchNumber - 1) % effectiveWriterCount];
-                        var jobs = CreateJobs(nextId, currentBatchSize, writerState, allPayloadSizesBytes);
-                        wave.Add((nextBatchNumber, currentBatchSize, jobs));
+                        await Task.WhenAll(workerTasks).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        completionError = ex;
+                    }
+                    finally
+                    {
+                        batchResults.Writer.TryComplete(completionError);
+                    }
+                });
 
-                        nextId += currentBatchSize;
-                        remainingForWave -= currentBatchSize;
-                        nextBatchNumber++;
+                var completedBatches = 0;
+                await foreach (var result in batchResults.Reader.ReadAllAsync().ConfigureAwait(false))
+                {
+                    completedBatches++;
+                    insertedTotal += result.BatchSize;
+                    windowInserted += result.BatchSize;
+                    windowDurations.Add(result.BatchDurationMs);
+                    allBatchDurations.Add(result.BatchDurationMs);
+                    allPayloadSizesBytes.AddRange(result.PayloadSizesBytes);
+
+                    var shouldLogProgress = completedBatches % progressEveryBatches == 0 || insertedTotal >= scenario.TotalChunks;
+                    if (!shouldLogProgress)
+                    {
+                        continue;
                     }
 
-                    var waveTasks = wave
-                        .Select(async item =>
-                        {
-                            var batchStopwatch = Stopwatch.StartNew();
-                            await batcher.AppendBatchAsync(item.Jobs, CancellationToken.None).ConfigureAwait(false);
-                            batchStopwatch.Stop();
-                            Assert.All(item.Jobs, job => Assert.Equal(WriteJob.WriteResult.Committed, job.Result));
-                            return (item.BatchNumber, item.BatchSize, BatchDurationMs: batchStopwatch.Elapsed.TotalMilliseconds);
-                        })
-                        .ToArray();
+                    var windowAvgBatchMs = windowDurations.Average();
+                    var windowP95BatchMs = Percentile(windowDurations, 0.95);
+                    var elapsedWindowSeconds = Math.Max(windowStopwatch.Elapsed.TotalSeconds, double.Epsilon);
+                    var windowThroughput = windowInserted / elapsedWindowSeconds;
+                    var elapsedTotalSeconds = totalStopwatch.Elapsed.TotalSeconds;
+                    var progressPct = insertedTotal * 100d / scenario.TotalChunks;
 
-                    var waveResults = await Task.WhenAll(waveTasks).ConfigureAwait(false);
-
-                    foreach (var result in waveResults.OrderBy(x => x.BatchNumber))
+                    if (!baselineAvgBatchMs.HasValue)
                     {
-                        insertedTotal += result.BatchSize;
-                        windowInserted += result.BatchSize;
-                        windowDurations.Add(result.BatchDurationMs);
-                        allBatchDurations.Add(result.BatchDurationMs);
-
-                        var shouldLogProgress = result.BatchNumber % progressEveryBatches == 0 || insertedTotal >= scenario.TotalChunks;
-                        if (!shouldLogProgress)
-                        {
-                            continue;
-                        }
-
-                        var windowAvgBatchMs = windowDurations.Average();
-                        var windowP95BatchMs = Percentile(windowDurations, 0.95);
-                        var elapsedWindowSeconds = Math.Max(windowStopwatch.Elapsed.TotalSeconds, double.Epsilon);
-                        var windowThroughput = windowInserted / elapsedWindowSeconds;
-                        var elapsedTotalSeconds = totalStopwatch.Elapsed.TotalSeconds;
-                        var progressPct = insertedTotal * 100d / scenario.TotalChunks;
-
-                        if (!baselineAvgBatchMs.HasValue)
-                        {
-                            baselineAvgBatchMs = windowAvgBatchMs;
-                        }
-
-                        var degradation = windowAvgBatchMs / baselineAvgBatchMs.Value;
-                        worstDegradation = Math.Max(worstDegradation, degradation);
-                        lastDegradation = degradation;
-
-                        var lastPosition = await store.ReadLastPositionAsync().ConfigureAwait(false);
-                        var line = string.Format(
-                            CultureInfo.InvariantCulture,
-                            "{0},{1},{2},{3},{4:F2},{5},{6:F2},{7:F2},{8:F0},{9:F2},{10:F3},{11}",
-                            DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture),
-                            result.BatchNumber,
-                            insertedTotal,
-                            scenario.TotalChunks,
-                            progressPct,
-                            windowDurations.Count,
-                            windowAvgBatchMs,
-                            windowP95BatchMs,
-                            windowThroughput,
-                            elapsedTotalSeconds,
-                            degradation,
-                            lastPosition);
-
-                        _output.WriteLine(line);
-                        await writer.WriteLineAsync(line);
-                        await writer.FlushAsync();
-
-                        windowDurations.Clear();
-                        windowInserted = 0;
-                        windowStopwatch.Restart();
+                        baselineAvgBatchMs = windowAvgBatchMs;
                     }
+
+                    var degradation = windowAvgBatchMs / baselineAvgBatchMs.Value;
+                    worstDegradation = Math.Max(worstDegradation, degradation);
+                    lastDegradation = degradation;
+
+                    var lastPosition = warmupInserted + insertedTotal;
+                    var line = string.Format(
+                        CultureInfo.InvariantCulture,
+                        "{0},{1},{2},{3},{4:F2},{5},{6:F2},{7:F2},{8:F0},{9:F2},{10:F3},{11}",
+                        DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture),
+                        completedBatches,
+                        insertedTotal,
+                        scenario.TotalChunks,
+                        progressPct,
+                        windowDurations.Count,
+                        windowAvgBatchMs,
+                        windowP95BatchMs,
+                        windowThroughput,
+                        elapsedTotalSeconds,
+                        degradation,
+                        lastPosition);
+
+                    _output.WriteLine(line);
+                    await writer.WriteLineAsync(line);
+                    await writer.FlushAsync();
+
+                    windowDurations.Clear();
+                    windowInserted = 0;
+                    windowStopwatch.Restart();
                 }
+
+                await workersCompletionTask.ConfigureAwait(false);
 
                 totalStopwatch.Stop();
                 var medianSingleBatchMs = allBatchDurations.Count == 0
@@ -967,6 +1000,23 @@ namespace NStore.Persistence.Mongo.Tests
             public double LastDegradation { get; set; }
             public double WorstDegradation { get; set; }
             public string ScenarioLogFile { get; set; }
+        }
+
+        private sealed class batch_execution_result
+        {
+            public batch_execution_result(
+                int batchSize,
+                double batchDurationMs,
+                List<int> payloadSizesBytes)
+            {
+                BatchSize = batchSize;
+                BatchDurationMs = batchDurationMs;
+                PayloadSizesBytes = payloadSizesBytes;
+            }
+
+            public int BatchSize { get; }
+            public double BatchDurationMs { get; }
+            public List<int> PayloadSizesBytes { get; }
         }
 
         private sealed class complex_batch_document
