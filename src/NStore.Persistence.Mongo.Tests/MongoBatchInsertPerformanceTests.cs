@@ -9,6 +9,7 @@ using System.Threading.Channels;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
 using MongoDB.Bson;
+using MongoDB.Driver;
 using NStore.Core.Persistence;
 using NStore.Persistence.Tests;
 using Xunit;
@@ -30,6 +31,20 @@ namespace NStore.Persistence.Mongo.Tests
         private const string ScenarioFilterVar = "NSTORE_MONGO_BATCH_PERF_SCENARIO";
         private const string LogFileVar = "NSTORE_MONGO_BATCH_PERF_LOG_FILE";
         private const string PerformanceProfilesConfigPath = "NStore:Mongo:Performance:TestParameters";
+        private const string MongoConnectionEnvVar = "NSTORE_MONGODB";
+        private const int InterScenarioDelaySeconds = 5;
+        private static readonly string[] PerfMongoConnectionConfigKeys =
+        {
+            "NStore:Mongo:Performance:ConnectionString",
+            "NStore:Mongo:Performance:AtlasConnectionString"
+        };
+
+        private static readonly string[] MongoConnectionConfigKeys =
+        {
+            "NStore:Mongo:ConnectionString"
+        };
+
+        private const int DurationSampleLimit = 4_096;
         private const string LongTextTemplate =
             "This benchmark payload is intentionally verbose to stress serialization, indexing, and storage paths with deterministic long-form content that can be reproduced across runs and compared over time for regression analysis.";
 
@@ -107,15 +122,19 @@ namespace NStore.Persistence.Mongo.Tests
                 Directory.CreateDirectory(suiteDirectory);
             }
 
+            var mongoTargetUrl = ResolveSanitizedMongoTargetUrl();
             _output.WriteLine($"Mongo batch benchmark suite: scenarios={scenarios.Count}, partitions={partitionCount}, warmup={warmupBatches}.");
+            _output.WriteLine($"Mongo batch benchmark target: {mongoTargetUrl}");
             _output.WriteLine($"Mongo batch benchmark suite log: {suiteLogFile}");
+            Console.WriteLine($"Mongo batch benchmark target: {mongoTargetUrl}");
 
             await using var suiteWriter = new StreamWriter(suiteLogFile, append: false);
+            await suiteWriter.WriteLineAsync($"# mongodb_url={mongoTargetUrl}");
             await suiteWriter.WriteLineAsync($"# started_utc={DateTimeOffset.UtcNow:O}");
             await suiteWriter.WriteLineAsync(
-                $"# scenarios={scenarios.Count},partitions={partitionCount},warmup_batches={warmupBatches},progress_every_batches={(configuredProgressEveryBatches.HasValue ? configuredProgressEveryBatches.Value.ToString(CultureInfo.InvariantCulture) : "auto")}");
+                $"# scenarios={scenarios.Count},partitions={partitionCount},warmup_batches={warmupBatches},progress_every_batches={(configuredProgressEveryBatches.HasValue ? configuredProgressEveryBatches.Value.ToString(CultureInfo.InvariantCulture) : "auto")},inter_scenario_delay_s={InterScenarioDelaySeconds}");
             await suiteWriter.WriteLineAsync(
-                "scenario_name,batch_size,writers,total_chunks,partitions,total_batches,total_elapsed_s,overall_throughput_items_per_sec,median_single_batch_ms,median_payload_size_bytes,last_degradation_x,worst_degradation_x,scenario_log_file");
+                "scenario_name,batch_size,writers,total_chunks,partitions,total_batches,total_elapsed_s,overall_throughput_items_per_sec,median_single_batch_ms,representative_payload_size_bytes,last_degradation_x,worst_degradation_x,scenario_log_file");
             await suiteWriter.FlushAsync();
 
             var runResults = new List<perf_run_result>(scenarios.Count);
@@ -129,6 +148,7 @@ namespace NStore.Persistence.Mongo.Tests
                     warmupBatches,
                     configuredProgressEveryBatches,
                     maxDegradation,
+                    mongoTargetUrl,
                     scenarioLogFile).ConfigureAwait(false);
 
                 runResults.Add(result);
@@ -144,7 +164,7 @@ namespace NStore.Persistence.Mongo.Tests
                     result.TotalElapsedSeconds,
                     result.OverallThroughputItemsPerSecond,
                     result.MedianSingleBatchMs,
-                    result.MedianPayloadSizeBytes,
+                    result.RepresentativePayloadSizeBytes,
                     result.LastDegradation,
                     result.WorstDegradation,
                     CsvEscape(result.ScenarioLogFile));
@@ -152,6 +172,15 @@ namespace NStore.Persistence.Mongo.Tests
                 _output.WriteLine(suiteLine);
                 await suiteWriter.WriteLineAsync(suiteLine);
                 await suiteWriter.FlushAsync();
+
+                if (scenarioIndex + 1 < scenarios.Count)
+                {
+                    var cooldownMessage =
+                        $"Mongo batch benchmark cooldown: waiting {InterScenarioDelaySeconds}s before next scenario to reduce server oplog pressure.";
+                    _output.WriteLine(cooldownMessage);
+                    Console.WriteLine(cooldownMessage);
+                    await Task.Delay(TimeSpan.FromSeconds(InterScenarioDelaySeconds)).ConfigureAwait(false);
+                }
             }
 
             var totalSuiteElapsedSeconds = runResults.Sum(x => x.TotalElapsedSeconds);
@@ -176,15 +205,25 @@ namespace NStore.Persistence.Mongo.Tests
             int warmupBatches,
             int? configuredProgressEveryBatches,
             double? maxDegradation,
+            string mongoTargetUrl,
             string logFile)
         {
-            var totalBatches = (int)Math.Ceiling(scenario.TotalChunks / (double)scenario.BatchSize);
+            var totalBatches = scenario.TotalChunks / scenario.BatchSize;
+            if (scenario.TotalChunks % scenario.BatchSize != 0)
+            {
+                totalBatches++;
+            }
+
             var effectiveWriterCount = ResolveEffectiveWriterCount(
                 scenario.Writers,
                 totalBatches,
                 partitionCount);
-            var progressEveryBatches = configuredProgressEveryBatches ?? Math.Max(1, totalBatches / 20);
+            var progressEveryBatches = configuredProgressEveryBatches.HasValue
+                ? configuredProgressEveryBatches.Value
+                : Math.Max(1L, totalBatches / 20);
             progressEveryBatches = Math.Min(progressEveryBatches, totalBatches);
+            var representativePayloadSizeBytes = EstimatePayloadSizeBytes(
+                CreateComplexPayload(1, "perf-stream-0000", 1));
 
             var logDirectory = Path.GetDirectoryName(logFile);
             if (!string.IsNullOrWhiteSpace(logDirectory))
@@ -193,6 +232,7 @@ namespace NStore.Persistence.Mongo.Tests
             }
 
             await using var writer = new StreamWriter(logFile, append: false);
+            await writer.WriteLineAsync($"# mongodb_url={mongoTargetUrl}");
             await writer.WriteLineAsync($"# started_utc={DateTimeOffset.UtcNow:O}");
             await writer.WriteLineAsync(
                 $"# scenario={scenario.Name},total_chunks={scenario.TotalChunks},batch_size={scenario.BatchSize},writers={FormatWriters(scenario.Writers)},effective_writers={effectiveWriterCount},partitions={partitionCount},total_batches={totalBatches},warmup_batches={warmupBatches},progress_every_batches={progressEveryBatches}");
@@ -202,7 +242,9 @@ namespace NStore.Persistence.Mongo.Tests
 
             _output.WriteLine(
                 $"Mongo batch scenario: name={scenario.Name}, totalChunks={scenario.TotalChunks}, batchSize={scenario.BatchSize}, writers={FormatWriters(scenario.Writers)}, effectiveWriters={effectiveWriterCount}, partitions={partitionCount}, totalBatches={totalBatches}, warmup={warmupBatches}, progressEveryBatches={progressEveryBatches}.");
+            _output.WriteLine($"Mongo batch scenario target: {mongoTargetUrl}");
             _output.WriteLine($"Mongo batch scenario log: {logFile}");
+            Console.WriteLine($"Mongo batch scenario target: {mongoTargetUrl}");
 
             var persistence = Create(true);
             try
@@ -228,9 +270,14 @@ namespace NStore.Persistence.Mongo.Tests
 
                 var totalStopwatch = Stopwatch.StartNew();
                 var windowStopwatch = Stopwatch.StartNew();
-                var windowDurations = new List<double>(progressEveryBatches);
-                var allBatchDurations = new List<double>(totalBatches);
-                var allPayloadSizesBytes = new List<int>();
+                var windowDurationSamples = new List<double>(DurationSampleLimit);
+                var overallDurationSamples = new List<double>(DurationSampleLimit);
+                var windowSampler = new Random(17);
+                var overallSampler = new Random(31);
+                long windowSampleSeen = 0;
+                long overallSampleSeen = 0;
+                long windowBatchCount = 0;
+                double windowBatchDurationSumMs = 0;
 
                 long insertedTotal = 0;
                 long windowInserted = 0;
@@ -238,15 +285,14 @@ namespace NStore.Persistence.Mongo.Tests
                 double worstDegradation = 0;
                 double lastDegradation = 0;
 
-                var batchResults = Channel.CreateBounded<batch_execution_result>(new BoundedChannelOptions(Math.Max(64, effectiveWriterCount * 4))
+                var batchResults = Channel.CreateUnbounded<batch_execution_result>(new UnboundedChannelOptions
                 {
                     SingleReader = true,
                     SingleWriter = false,
-                    FullMode = BoundedChannelFullMode.Wait,
                     AllowSynchronousContinuations = false
                 });
 
-                var nextBatchNumber = 0;
+                long nextBatchNumber = 0;
                 var nextPayloadId = nextId;
 
                 var workerTasks = writerStates
@@ -263,9 +309,8 @@ namespace NStore.Persistence.Mongo.Tests
 
                                 var remainingForBatch = scenario.TotalChunks - (long)(batchNumber - 1) * scenario.BatchSize;
                                 var currentBatchSize = (int)Math.Min(remainingForBatch, scenario.BatchSize);
-                                var payloadSizes = new List<int>(currentBatchSize);
                                 var startId = Interlocked.Add(ref nextPayloadId, currentBatchSize) - currentBatchSize;
-                                var jobs = CreateJobs(startId, currentBatchSize, writerState, payloadSizes);
+                                var jobs = CreateJobs(startId, currentBatchSize, writerState);
 
                                 var batchStopwatch = Stopwatch.StartNew();
                                 await batcher.AppendBatchAsync(jobs, CancellationToken.None).ConfigureAwait(false);
@@ -275,8 +320,7 @@ namespace NStore.Persistence.Mongo.Tests
                                 await batchResults.Writer.WriteAsync(
                                         new batch_execution_result(
                                             currentBatchSize,
-                                            batchStopwatch.Elapsed.TotalMilliseconds,
-                                            payloadSizes),
+                                            batchStopwatch.Elapsed.TotalMilliseconds),
                                         CancellationToken.None)
                                     .ConfigureAwait(false);
                             }
@@ -300,15 +344,16 @@ namespace NStore.Persistence.Mongo.Tests
                     }
                 });
 
-                var completedBatches = 0;
+                long completedBatches = 0;
                 await foreach (var result in batchResults.Reader.ReadAllAsync().ConfigureAwait(false))
                 {
                     completedBatches++;
                     insertedTotal += result.BatchSize;
                     windowInserted += result.BatchSize;
-                    windowDurations.Add(result.BatchDurationMs);
-                    allBatchDurations.Add(result.BatchDurationMs);
-                    allPayloadSizesBytes.AddRange(result.PayloadSizesBytes);
+                    windowBatchCount++;
+                    windowBatchDurationSumMs += result.BatchDurationMs;
+                    AddDurationSample(windowDurationSamples, ref windowSampleSeen, result.BatchDurationMs, windowSampler);
+                    AddDurationSample(overallDurationSamples, ref overallSampleSeen, result.BatchDurationMs, overallSampler);
 
                     var shouldLogProgress = completedBatches % progressEveryBatches == 0 || insertedTotal >= scenario.TotalChunks;
                     if (!shouldLogProgress)
@@ -316,8 +361,10 @@ namespace NStore.Persistence.Mongo.Tests
                         continue;
                     }
 
-                    var windowAvgBatchMs = windowDurations.Average();
-                    var windowP95BatchMs = Percentile(windowDurations, 0.95);
+                    var windowAvgBatchMs = windowBatchDurationSumMs / Math.Max(windowBatchCount, 1);
+                    var windowP95BatchMs = windowDurationSamples.Count == 0
+                        ? 0
+                        : Percentile(windowDurationSamples, 0.95);
                     var elapsedWindowSeconds = Math.Max(windowStopwatch.Elapsed.TotalSeconds, double.Epsilon);
                     var windowThroughput = windowInserted / elapsedWindowSeconds;
                     var elapsedTotalSeconds = totalStopwatch.Elapsed.TotalSeconds;
@@ -341,7 +388,7 @@ namespace NStore.Persistence.Mongo.Tests
                         insertedTotal,
                         scenario.TotalChunks,
                         progressPct,
-                        windowDurations.Count,
+                        windowBatchCount,
                         windowAvgBatchMs,
                         windowP95BatchMs,
                         windowThroughput,
@@ -351,9 +398,11 @@ namespace NStore.Persistence.Mongo.Tests
 
                     _output.WriteLine(line);
                     await writer.WriteLineAsync(line);
-                    await writer.FlushAsync();
 
-                    windowDurations.Clear();
+                    windowDurationSamples.Clear();
+                    windowSampleSeen = 0;
+                    windowBatchCount = 0;
+                    windowBatchDurationSumMs = 0;
                     windowInserted = 0;
                     windowStopwatch.Restart();
                 }
@@ -361,20 +410,17 @@ namespace NStore.Persistence.Mongo.Tests
                 await workersCompletionTask.ConfigureAwait(false);
 
                 totalStopwatch.Stop();
-                var medianSingleBatchMs = allBatchDurations.Count == 0
+                var medianSingleBatchMs = overallDurationSamples.Count == 0
                     ? 0
-                    : Percentile(allBatchDurations, 0.50);
-                var medianPayloadSizeBytes = allPayloadSizesBytes.Count == 0
-                    ? 0
-                    : Percentile(allPayloadSizesBytes, 0.50);
+                    : Percentile(overallDurationSamples, 0.50);
 
                 var summaryLine = string.Format(
                     CultureInfo.InvariantCulture,
-                    "# summary,total_chunks={0},total_elapsed_s={1:F2},median_single_batch_ms={2:F2},median_payload_size_bytes={3:F0},last_degradation_x={4:F3},worst_degradation_x={5:F3}",
+                    "# summary,total_chunks={0},total_elapsed_s={1:F2},median_single_batch_ms={2:F2},representative_payload_size_bytes={3:F0},last_degradation_x={4:F3},worst_degradation_x={5:F3}",
                     scenario.TotalChunks,
                     totalStopwatch.Elapsed.TotalSeconds,
                     medianSingleBatchMs,
-                    medianPayloadSizeBytes,
+                    representativePayloadSizeBytes,
                     lastDegradation,
                     worstDegradation);
 
@@ -401,7 +447,7 @@ namespace NStore.Persistence.Mongo.Tests
                     TotalElapsedSeconds = totalStopwatch.Elapsed.TotalSeconds,
                     OverallThroughputItemsPerSecond = scenario.TotalChunks / Math.Max(totalStopwatch.Elapsed.TotalSeconds, double.Epsilon),
                     MedianSingleBatchMs = medianSingleBatchMs,
-                    MedianPayloadSizeBytes = medianPayloadSizeBytes,
+                    RepresentativePayloadSizeBytes = representativePayloadSizeBytes,
                     LastDegradation = lastDegradation,
                     WorstDegradation = worstDegradation,
                     ScenarioLogFile = logFile
@@ -419,8 +465,7 @@ namespace NStore.Persistence.Mongo.Tests
         private static WriteJob[] CreateJobs(
             long startId,
             int batchSize,
-            writer_partition_state writerState,
-            List<int> payloadSizesBytes = null)
+            writer_partition_state writerState)
         {
             var jobs = new WriteJob[batchSize];
             for (var i = 0; i < batchSize; i++)
@@ -432,7 +477,6 @@ namespace NStore.Persistence.Mongo.Tests
                 var streamIndex = writerState.NextOffset / writerState.PartitionCount + 1;
                 writerState.NextOffset++;
                 var payload = CreateComplexPayload(currentId, partitionId, streamIndex);
-                payloadSizesBytes?.Add(EstimatePayloadSizeBytes(payload));
                 jobs[i] = new WriteJob(
                     partitionId,
                     streamIndex,
@@ -613,12 +657,24 @@ namespace NStore.Persistence.Mongo.Tests
             return ordered[index];
         }
 
-        private static double Percentile(IReadOnlyList<int> values, double percentile)
+        private static void AddDurationSample(
+            List<double> samples,
+            ref long valuesSeen,
+            double value,
+            Random random)
         {
-            var ordered = values.OrderBy(x => x).ToArray();
-            var index = (int)Math.Ceiling(percentile * ordered.Length) - 1;
-            index = Math.Max(0, Math.Min(index, ordered.Length - 1));
-            return ordered[index];
+            valuesSeen++;
+            if (samples.Count < DurationSampleLimit)
+            {
+                samples.Add(value);
+                return;
+            }
+
+            var replacement = random.NextInt64(valuesSeen);
+            if (replacement < DurationSampleLimit)
+            {
+                samples[(int)replacement] = value;
+            }
         }
 
         private static string ResolveSuiteLogFilePath(string configuredPath)
@@ -691,9 +747,74 @@ namespace NStore.Persistence.Mongo.Tests
             return "\"" + value.Replace("\"", "\"\"") + "\"";
         }
 
+        private static string ResolveSanitizedMongoTargetUrl()
+        {
+            var connectionString = ResolveMongoConnectionStringForReporting();
+            try
+            {
+                var url = new MongoUrl(connectionString);
+                var isSrv = connectionString.StartsWith("mongodb+srv://", StringComparison.OrdinalIgnoreCase);
+                var protocol = isSrv ? "mongodb+srv" : "mongodb";
+                var hosts = string.Join(
+                    ",",
+                    url.Servers.Select(server => isSrv ? server.Host : $"{server.Host}:{server.Port}"));
+                var databaseName = string.IsNullOrWhiteSpace(url.DatabaseName)
+                    ? "(default)"
+                    : url.DatabaseName;
+
+                return $"{protocol}://{hosts}/{databaseName}";
+            }
+            catch
+            {
+                return "unparseable://(invalid-connection-string)";
+            }
+        }
+
+        private static string ResolveMongoConnectionStringForReporting()
+        {
+            var mongo = Environment.GetEnvironmentVariable(MongoConnectionEnvVar);
+            if (!string.IsNullOrWhiteSpace(mongo))
+            {
+                return mongo;
+            }
+
+            var config = GetTestConfiguration();
+            if (IsEnabled(Environment.GetEnvironmentVariable(PerfEnabledVar)))
+            {
+                var perfMongo = ReadFirstConfiguredValue(config, PerfMongoConnectionConfigKeys);
+                if (!string.IsNullOrWhiteSpace(perfMongo))
+                {
+                    return perfMongo;
+                }
+            }
+
+            mongo = ReadFirstConfiguredValue(config, MongoConnectionConfigKeys);
+            if (!string.IsNullOrWhiteSpace(mongo))
+            {
+                return mongo;
+            }
+
+            throw new TestMisconfiguredException(
+                $"Mongo connection string not set. Configure {MongoConnectionEnvVar} or appsettings/user-secrets keys: {string.Join(", ", PerfMongoConnectionConfigKeys)} or {string.Join(", ", MongoConnectionConfigKeys)}.");
+        }
+
+        private static string ReadFirstConfiguredValue(IConfiguration config, string[] keys)
+        {
+            for (var i = 0; i < keys.Length; i++)
+            {
+                var value = config[keys[i]];
+                if (!string.IsNullOrWhiteSpace(value))
+                {
+                    return value;
+                }
+            }
+
+            return null;
+        }
+
         private static int ResolveEffectiveWriterCount(
             int configuredWriters,
-            int totalBatches,
+            long totalBatches,
             int partitionCount)
         {
             if (configuredWriters > 0)
@@ -701,7 +822,7 @@ namespace NStore.Persistence.Mongo.Tests
                 return configuredWriters;
             }
 
-            return Math.Max(1, Math.Min(totalBatches, partitionCount));
+            return Math.Max(1, (int)Math.Min(totalBatches, partitionCount));
         }
 
         private static string FormatWriters(int configuredWriters)
@@ -748,7 +869,7 @@ namespace NStore.Persistence.Mongo.Tests
                 Name = "env-default",
                 BatchSize = ReadIntSetting(BatchSizeVar, 1_000, 1),
                 Writers = ReadWritersSetting(WritersVar, 1),
-                TotalChunks = ReadLongSetting(TotalChunksVar, 2_000, 1)
+                TotalChunks = ReadLongSetting(TotalChunksVar, 1_000, 1)
             };
         }
 
@@ -992,11 +1113,11 @@ namespace NStore.Persistence.Mongo.Tests
             public int WriterCount { get; set; }
             public long TotalChunks { get; set; }
             public int PartitionCount { get; set; }
-            public int TotalBatches { get; set; }
+            public long TotalBatches { get; set; }
             public double TotalElapsedSeconds { get; set; }
             public double OverallThroughputItemsPerSecond { get; set; }
             public double MedianSingleBatchMs { get; set; }
-            public double MedianPayloadSizeBytes { get; set; }
+            public double RepresentativePayloadSizeBytes { get; set; }
             public double LastDegradation { get; set; }
             public double WorstDegradation { get; set; }
             public string ScenarioLogFile { get; set; }
@@ -1006,17 +1127,14 @@ namespace NStore.Persistence.Mongo.Tests
         {
             public batch_execution_result(
                 int batchSize,
-                double batchDurationMs,
-                List<int> payloadSizesBytes)
+                double batchDurationMs)
             {
                 BatchSize = batchSize;
                 BatchDurationMs = batchDurationMs;
-                PayloadSizesBytes = payloadSizesBytes;
             }
 
             public int BatchSize { get; }
             public double BatchDurationMs { get; }
-            public List<int> PayloadSizesBytes { get; }
         }
 
         private sealed class complex_batch_document

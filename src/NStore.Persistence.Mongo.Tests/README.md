@@ -100,10 +100,10 @@ Each scenario supports:
 
 Current default scenarios in `appsettings.json`:
 
-- `batch-100-writers-1-chunks-2000`
-- `batch-50-writers-2-chunks-2000`
-- `batch-25-writers-4-chunks-2000`
-- `batch-25-writers-unbounded-chunks-2000`
+- `batch-100-writers-1-chunks-1000`
+- `batch-50-writers-2-chunks-1000`
+- `batch-25-writers-4-chunks-1000`
+- `batch-25-writers-unbounded-chunks-1000`
 
 Execution order is:
 
@@ -112,6 +112,7 @@ Execution order is:
 3. `Name` ascending
 
 Each scenario starts from an empty test database (`Create(true)` / `DropOnInit`).
+The suite waits 5 seconds between scenarios to reduce transient server/oplog pressure.
 
 ### Run One Scenario
 
@@ -119,7 +120,7 @@ Use `NSTORE_MONGO_BATCH_PERF_SCENARIO` with one or more comma-separated names:
 
 ```bash
 NSTORE_MONGO_BATCH_PERF=1 \
-NSTORE_MONGO_BATCH_PERF_SCENARIO='batch-25-writers-unbounded-chunks-2000' \
+NSTORE_MONGO_BATCH_PERF_SCENARIO='batch-25-writers-unbounded-chunks-1000' \
 dotnet test src/NStore.Persistence.Mongo.Tests/NStore.Persistence.Mongo.Tests.csproj -c Release -f net10.0 \
   --filter "FullyQualifiedName~mongodb_batch_insert_performance_tests.should_measure_batch_insert_performance_degradation"
 ```
@@ -136,7 +137,7 @@ dotnet test src/NStore.Persistence.Mongo.Tests/NStore.Persistence.Mongo.Tests.cs
 
 When no config scenarios are found, env fallback is used:
 
-- `NSTORE_MONGO_BATCH_PERF_TOTAL_CHUNKS` (default `2000`)
+- `NSTORE_MONGO_BATCH_PERF_TOTAL_CHUNKS` (default `1000`)
 - `NSTORE_MONGO_BATCH_PERF_BATCH_SIZE` (default `1000`)
 - `NSTORE_MONGO_BATCH_PERF_WRITERS` (default `1`, accepts `"unbounded"`)
 
@@ -146,6 +147,10 @@ Perf run writes:
 
 - one suite CSV (summary of all executed scenarios)
 - one scenario CSV per scenario (detailed progress + scenario summary)
+- first CSV lines include metadata comments:
+  - `# mongodb_url=<scheme://server-or-cluster/database>` (credentials removed)
+  - `# started_utc=<timestamp>`
+  - suite also includes `inter_scenario_delay_s=5`
 
 Note:
 
