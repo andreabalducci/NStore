@@ -23,11 +23,10 @@ namespace NStore.Persistence.Tests
     public partial class BasePersistenceTest
     {
         private const string MongoConnectionEnvVar = "NSTORE_MONGODB";
-        private const string MongoPerfEnabledEnvVar = "NSTORE_MONGO_BATCH_PERF";
+        private const string PerfEnabledConfigKey = "NStore:Mongo:Performance:Enabled";
         private static readonly string[] PerfMongoConnectionConfigKeys =
         {
-            "NStore:Mongo:Performance:ConnectionString",
-            "NStore:Mongo:Performance:AtlasConnectionString"
+            "NStore:Mongo:Performance:ConnectionString"
         };
 
         private static readonly string[] MongoConnectionConfigKeys =
@@ -93,20 +92,29 @@ namespace NStore.Persistence.Tests
 
         private static string GetPartitionsConnectionString()
         {
-            var mongo = Environment.GetEnvironmentVariable(MongoConnectionEnvVar);
-            if (!string.IsNullOrWhiteSpace(mongo))
-            {
-                return mongo;
-            }
-
             var config = TestConfiguration.Value;
-            if (IsEnabled(Environment.GetEnvironmentVariable(MongoPerfEnabledEnvVar)))
+            if (ReadBooleanSetting(config, PerfEnabledConfigKey, fallback: false))
             {
                 var perfMongo = ReadFirstConfiguredValue(config, PerfMongoConnectionConfigKeys);
                 if (!string.IsNullOrWhiteSpace(perfMongo))
                 {
                     return perfMongo;
                 }
+
+                var defaultMongo = ReadFirstConfiguredValue(config, MongoConnectionConfigKeys);
+                if (!string.IsNullOrWhiteSpace(defaultMongo))
+                {
+                    return defaultMongo;
+                }
+
+                throw new TestMisconfiguredException(
+                    $"Mongo connection string not set. Configure appsettings/user-secrets keys: {string.Join(", ", PerfMongoConnectionConfigKeys)} (recommended for perf mode) or {string.Join(", ", MongoConnectionConfigKeys)}.");
+            }
+
+            var mongo = Environment.GetEnvironmentVariable(MongoConnectionEnvVar);
+            if (!string.IsNullOrWhiteSpace(mongo))
+            {
+                return mongo;
             }
 
             mongo = ReadFirstConfiguredValue(config, MongoConnectionConfigKeys);
@@ -116,7 +124,7 @@ namespace NStore.Persistence.Tests
             }
 
             throw new TestMisconfiguredException(
-                $"Mongo connection string not set. Configure {MongoConnectionEnvVar} or appsettings/user-secrets keys: {string.Join(", ", PerfMongoConnectionConfigKeys)} or {string.Join(", ", MongoConnectionConfigKeys)}.");
+                $"Mongo connection string not set. Configure {MongoConnectionEnvVar} or appsettings/user-secrets key: {string.Join(", ", MongoConnectionConfigKeys)}.");
         }
 
         private static string ReadFirstConfiguredValue(IConfiguration config, string[] keys)
@@ -145,6 +153,40 @@ namespace NStore.Persistence.Tests
                    value.Equals("yes", StringComparison.OrdinalIgnoreCase);
         }
 
+        private static bool IsDisabled(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return false;
+            }
+
+            return value == "0" ||
+                   value.Equals("false", StringComparison.OrdinalIgnoreCase) ||
+                   value.Equals("no", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool ReadBooleanSetting(IConfiguration config, string key, bool fallback)
+        {
+            var raw = config[key];
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                return fallback;
+            }
+
+            if (IsEnabled(raw))
+            {
+                return true;
+            }
+
+            if (IsDisabled(raw))
+            {
+                return false;
+            }
+
+            throw new ArgumentException(
+                $"{key} must be a boolean value (supported: true/false, yes/no, 1/0), but was '{raw}'.");
+        }
+
         private static string FindAppSettingsBasePath()
         {
             var current = new DirectoryInfo(AppContext.BaseDirectory);
@@ -168,8 +210,9 @@ namespace NStore.Persistence.Tests
             return new ConfigurationBuilder()
                 .SetBasePath(basePath)
                 .AddJsonFile("appsettings.json", optional: true, reloadOnChange: false)
-                .AddJsonFile("appsettings.Local.json", optional: true, reloadOnChange: false)
+                .AddJsonFile("appsettings.local.json", optional: true, reloadOnChange: false)
                 .AddUserSecrets(typeof(BasePersistenceTest).Assembly, optional: true)
+                .AddEnvironmentVariables()
                 .Build();
         }
 

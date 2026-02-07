@@ -11,19 +11,22 @@ This project contains MongoDB integration tests and Mongo batch performance benc
 
 ## Connection Configuration
 
-Connection string resolution order used by tests:
-
-1. `NSTORE_MONGODB` environment variable
-2. If `NSTORE_MONGO_BATCH_PERF=1`:
-   - `NStore:Mongo:Performance:ConnectionString`
-   - `NStore:Mongo:Performance:AtlasConnectionString`
-3. `NStore:Mongo:ConnectionString`
-
 Config sources loaded by tests:
 
 - `appsettings.json` (in this project)
 - optional `appsettings.Local.json`
 - user secrets (`UserSecretsId: nstore-persistence-mongo-tests`)
+
+Connection string resolution order:
+
+- Standard tests (`NStore:Mongo:Performance:Enabled` is not `true`):
+  1. `NSTORE_MONGODB` environment variable
+  2. `NStore:Mongo:ConnectionString`
+- Perf tests (`NStore:Mongo:Performance:Enabled=true`):
+  1. `NStore:Mongo:Performance:ConnectionString`
+  2. `NStore:Mongo:ConnectionString`
+
+Note: perf mode is config-driven; environment variables are not required to run perf tests.
 
 ## Durable Writes (Flush Guarantees)
 
@@ -51,47 +54,44 @@ docker run --name nstore-mongo -p 27017:27017 -d mongo:7
 Run all Mongo tests against local MongoDB:
 
 ```bash
-NSTORE_MONGODB='mongodb://localhost:27017/nstoredev?w=1&journal=true&wtimeoutMS=30000' \
 dotnet test src/NStore.Persistence.Mongo.Tests/NStore.Persistence.Mongo.Tests.csproj -c Release -f net10.0
 ```
 
 ## Cloud Mongo Setup (Atlas)
 
-Store connection string in user secrets:
+Store perf connection string in user secrets:
 
 ```bash
 dotnet user-secrets --project src/NStore.Persistence.Mongo.Tests/NStore.Persistence.Mongo.Tests.csproj \
   set "NStore:Mongo:Performance:ConnectionString" "mongodb+srv://<user>:<password>@<cluster>/<db>?authSource=admin&w=majority&journal=true&wtimeoutMS=30000"
 ```
 
-You can also set:
+## Performance Benchmark
+
+Perf benchmark tests:
+
+- `mongodb_batch_insert_performance_tests.should_measure_batch_insert_performance_degradation`
+- `mongodb_parallel_extension_batch_insert_performance_tests.should_measure_parallel_extension_batch_insert_performance_degradation`
+
+Enable perf mode in configuration (user secrets example):
 
 ```bash
 dotnet user-secrets --project src/NStore.Persistence.Mongo.Tests/NStore.Persistence.Mongo.Tests.csproj \
-  set "NStore:Mongo:Performance:AtlasConnectionString" "mongodb+srv://<user>:<password>@<cluster>/<db>?authSource=admin&w=majority&journal=true&wtimeoutMS=30000"
+  set "NStore:Mongo:Performance:Enabled" "true"
 ```
 
-## Performance Benchmark
-
-Main perf test:
-
-- `mongodb_batch_insert_performance_tests.should_measure_batch_insert_performance_degradation`
-
-Run only the perf benchmark test:
+Run only the channel-workers perf benchmark test:
 
 ```bash
-NSTORE_MONGO_BATCH_PERF=1 \
 dotnet test src/NStore.Persistence.Mongo.Tests/NStore.Persistence.Mongo.Tests.csproj -c Release -f net10.0 \
   --filter "FullyQualifiedName~mongodb_batch_insert_performance_tests.should_measure_batch_insert_performance_degradation"
 ```
 
-Run perf benchmark on Atlas/user-secrets perf connection string (ignores `NSTORE_MONGODB` if it is set in your shell):
+Run only the extension-method perf benchmark test:
 
 ```bash
-env -u NSTORE_MONGODB \
-NSTORE_MONGO_BATCH_PERF=1 \
 dotnet test src/NStore.Persistence.Mongo.Tests/NStore.Persistence.Mongo.Tests.csproj -c Release -f net10.0 \
-  --filter "FullyQualifiedName~mongodb_batch_insert_performance_tests.should_measure_batch_insert_performance_degradation"
+  --filter "FullyQualifiedName~mongodb_parallel_extension_batch_insert_performance_tests.should_measure_parallel_extension_batch_insert_performance_degradation"
 ```
 
 Run the normal suite without perf tests:
@@ -101,6 +101,15 @@ dotnet test src/NStore.Persistence.Mongo.Tests/NStore.Persistence.Mongo.Tests.cs
   --filter "Category!=Performance"
 ```
 
+Run both perf suites and print a consolidated summary table:
+
+```bash
+bash scripts/run-mongo-perf-tests.sh
+```
+
+The script enables perf mode for the test process via:
+`NStore__Mongo__Performance__Enabled=true`.
+
 ### Scenarios
 
 Scenarios are read from:
@@ -109,54 +118,44 @@ Scenarios are read from:
 
 Each scenario supports:
 
-- `Name` (string)
 - `BatchSize` (int)
 - `Writers` (int or `"unbounded"`)
-- `TotalChunks` (long)
-
-Current default scenarios in `appsettings.json`:
-
-- `batch-100-writers-1-chunks-1000`
-- `batch-50-writers-2-chunks-1000`
-- `batch-25-writers-4-chunks-1000`
-- `batch-25-writers-unbounded-chunks-1000`
+- `TotalChunks` (long, optional when `DefaultTotalChunks` is configured)
+- `Name` is derived automatically as: `chunks-<TotalChunks>-batch-<BatchSize>-writers-<Writers|unbounded>`
 
 Execution order is:
 
 1. `Writers` ascending (unbounded last)
 2. `BatchSize` ascending
-3. `Name` ascending
+3. `TotalChunks` ascending
 
 Each scenario starts from an empty test database (`Create(true)` / `DropOnInit`).
 The suite waits 5 seconds between scenarios to reduce transient server/oplog pressure.
 
 ### Run One Scenario
 
-Use `NSTORE_MONGO_BATCH_PERF_SCENARIO` with one or more comma-separated names:
+Set scenario filter in config (user secrets example):
 
 ```bash
-env -u NSTORE_MONGODB \
-NSTORE_MONGO_BATCH_PERF=1 \
-NSTORE_MONGO_BATCH_PERF_SCENARIO='batch-25-writers-unbounded-chunks-1000' \
-dotnet test src/NStore.Persistence.Mongo.Tests/NStore.Persistence.Mongo.Tests.csproj -c Release -f net10.0 \
-  --filter "FullyQualifiedName~mongodb_batch_insert_performance_tests.should_measure_batch_insert_performance_degradation"
+dotnet user-secrets --project src/NStore.Persistence.Mongo.Tests/NStore.Persistence.Mongo.Tests.csproj \
+  set "NStore:Mongo:Performance:ScenarioFilter" "chunks-1000-batch-25-writers-unbounded"
 ```
 
-### Useful Perf Environment Variables
+Then run the perf test command.
 
-- `NSTORE_MONGO_BATCH_PERF=1` enable benchmark
-- `NSTORE_MONGO_BATCH_PERF_LOG_FILE=/path/to/suite.csv` set output suite CSV path
-- `NSTORE_MONGO_BATCH_PERF_SCENARIO=<name[,name2]>` run only selected scenarios
-- `NSTORE_MONGO_BATCH_PERF_PARTITIONS=<int>` partition count (default `100`)
-- `NSTORE_MONGO_BATCH_PERF_WARMUP=<int>` warmup batches (default `3`)
-- `NSTORE_MONGO_BATCH_PERF_PROGRESS_EVERY_BATCHES=<int>` progress interval override
-- `NSTORE_MONGO_BATCH_PERF_MAX_DEGRADATION=<double>` optional assertion threshold (`>= 1.0`, where `1.0` = no degradation allowed)
+### Useful Perf Configuration Keys
 
-When no config scenarios are found, env fallback is used:
-
-- `NSTORE_MONGO_BATCH_PERF_TOTAL_CHUNKS` (default `1000`)
-- `NSTORE_MONGO_BATCH_PERF_BATCH_SIZE` (default `1000`)
-- `NSTORE_MONGO_BATCH_PERF_WRITERS` (default `1`, accepts `"unbounded"`)
+- `NStore:Mongo:Performance:Enabled` (bool) enable benchmark tests
+- `NStore:Mongo:Performance:ConnectionString` (string) perf Mongo target
+- `NStore:Mongo:Performance:SuiteLogFile` (string, optional) explicit suite CSV path
+- `NStore:Mongo:Performance:ScenarioFilter` (string, optional) comma-separated scenario names
+- `NStore:Mongo:Performance:PartitionCount` (int, default `100`)
+- `NStore:Mongo:Performance:DefaultTotalChunks` (long, optional fallback for scenario `TotalChunks`)
+- `NStore:Mongo:Performance:WarmupBatches` (int, default `3`)
+- `NStore:Mongo:Performance:ProgressEveryBatches` (int, optional)
+- `NStore:Mongo:Performance:MaxDegradation` (double, optional, informational only; does not fail tests)
+- `NStore:Mongo:Performance:ParallelBatchSize` (int, optional) parallel extension mode only
+- `NStore:Mongo:Performance:ParallelWriters` (int, optional) parallel extension mode only
 
 ## Output
 
@@ -169,9 +168,9 @@ Perf run writes:
   - `# started_utc=<timestamp>`
   - suite also includes `inter_scenario_delay_s=5`
 
-Note:
+Notes:
 
-- in suite CSV, unbounded writers are currently represented as `writers=0`
+- in suite CSV, `writers` is the configured value (`0` for unbounded) and `effective_writers` is the resolved runtime writer count
 - in scenario CSV header, both `writers=unbounded` and `effective_writers=<n>` are written
 
 By default output is under `TestResults/` in the test process working directory.

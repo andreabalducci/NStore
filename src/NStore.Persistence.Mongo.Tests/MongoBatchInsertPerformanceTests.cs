@@ -23,6 +23,7 @@ namespace NStore.Persistence.Mongo.Tests
         protected const string PerfEnabledConfigKey = PerformanceConfigPath + ":Enabled";
         protected const string PerformanceProfilesConfigPath = PerformanceConfigPath + ":TestParameters";
         protected const string PartitionCountConfigKey = PerformanceConfigPath + ":PartitionCount";
+        protected const string DefaultTotalChunksConfigKey = PerformanceConfigPath + ":DefaultTotalChunks";
         protected const string ProgressEveryBatchesConfigKey = PerformanceConfigPath + ":ProgressEveryBatches";
         protected const string WarmupBatchesConfigKey = PerformanceConfigPath + ":WarmupBatches";
         protected const string MaxDegradationConfigKey = PerformanceConfigPath + ":MaxDegradation";
@@ -30,12 +31,9 @@ namespace NStore.Persistence.Mongo.Tests
         protected const string SuiteLogFileConfigKey = PerformanceConfigPath + ":SuiteLogFile";
         private const string ParallelBatchSizeConfigKey = PerformanceConfigPath + ":ParallelBatchSize";
         private const string ParallelWritersConfigKey = PerformanceConfigPath + ":ParallelWriters";
+        private const string PerfMongoConnectionConfigKey = PerformanceConfigPath + ":ConnectionString";
         protected const int InterScenarioDelaySeconds = 5;
         protected const int WorkerShutdownTimeoutSeconds = 30;
-        private static readonly string[] PerfMongoConnectionConfigKeys =
-        {
-            "NStore:Mongo:Performance:ConnectionString"
-        };
 
         private static readonly string[] MongoConnectionConfigKeys =
         {
@@ -54,9 +52,9 @@ namespace NStore.Persistence.Mongo.Tests
         }
         protected ITestOutputHelper Output => _output;
 
-        protected bool TrySkipWhenPerfDisabled()
+        protected bool TrySkipWhenPerfDisabled(MongoBatchInsertPerfSettings settings)
         {
-            if (ReadBoolSetting(PerfEnabledConfigKey, fallback: false))
+            if (settings.Enabled)
             {
                 return false;
             }
@@ -66,9 +64,11 @@ namespace NStore.Persistence.Mongo.Tests
             return true;
         }
 
-        protected static List<PerfTestConfiguration> LoadScenarios(int partitionCount)
+        protected static List<PerfTestConfiguration> LoadScenarios(
+            MongoBatchInsertPerfSettings settings,
+            int partitionCount)
         {
-            var scenarios = ReadConfiguredScenarios();
+            var scenarios = ReadConfiguredScenarios(settings);
             if (scenarios.Count == 0)
             {
                 throw new ArgumentException(
@@ -78,10 +78,10 @@ namespace NStore.Persistence.Mongo.Tests
             scenarios = scenarios
                 .OrderBy(x => x.Writers <= 0 ? int.MaxValue : x.Writers)
                 .ThenBy(x => x.BatchSize)
-                .ThenBy(x => x.Name)
+                .ThenBy(x => x.TotalChunks)
                 .ToList();
 
-            var scenarioFilter = ReadStringSetting(ScenarioFilterConfigKey);
+            var scenarioFilter = NormalizeConfiguredString(settings.ScenarioFilter);
             if (!string.IsNullOrWhiteSpace(scenarioFilter))
             {
                 var selectedNames = scenarioFilter
@@ -158,14 +158,12 @@ namespace NStore.Persistence.Mongo.Tests
             Output.WriteLine($"Mongo batch scenario log: {logFile}");
         }
 
-        protected static ParallelBatchAppendOptions ReadParallelOptionsFromConfiguration()
+        protected static ParallelBatchAppendOptions ReadParallelOptionsFromConfiguration(MongoBatchInsertPerfSettings settings)
         {
-            var parallelBatchSize = ReadOptionalIntSetting(ParallelBatchSizeConfigKey, 1);
-            var parallelWriters = ReadOptionalIntSetting(ParallelWritersConfigKey, 1);
             return new ParallelBatchAppendOptions
             {
-                BatchSize = parallelBatchSize ?? 0,
-                MaxWriters = parallelWriters ?? 0
+                BatchSize = settings.ParallelBatchSize,
+                MaxWriters = settings.ParallelWriters
             };
         }
 
@@ -481,16 +479,17 @@ namespace NStore.Persistence.Mongo.Tests
 
         private static string ResolveMongoConnectionStringForReporting()
         {
-            var config = GetTestConfiguration();
-            if (ReadBoolSetting(config, PerfEnabledConfigKey, fallback: false))
+            var perfSettings = ReadPerformanceSettings();
+            if (perfSettings.Enabled)
             {
-                var perfMongo = ReadFirstConfiguredValue(config, PerfMongoConnectionConfigKeys);
+                var perfMongo = NormalizeConfiguredString(perfSettings.ConnectionString);
                 if (!string.IsNullOrWhiteSpace(perfMongo))
                 {
                     return perfMongo;
                 }
             }
 
+            var config = GetTestConfiguration();
             var mongo = ReadFirstConfiguredValue(config, MongoConnectionConfigKeys);
             if (!string.IsNullOrWhiteSpace(mongo))
             {
@@ -498,7 +497,7 @@ namespace NStore.Persistence.Mongo.Tests
             }
 
             throw new TestMisconfiguredException(
-                $"Mongo connection string not set. Configure appsettings/user-secrets keys: {string.Join(", ", PerfMongoConnectionConfigKeys)} (when {PerfEnabledConfigKey}=true) or {string.Join(", ", MongoConnectionConfigKeys)}.");
+                $"Mongo connection string not set. Configure appsettings/user-secrets keys: {PerfMongoConnectionConfigKey} (when {PerfEnabledConfigKey}=true) or {string.Join(", ", MongoConnectionConfigKeys)}.");
         }
 
         private static string ReadFirstConfiguredValue(IConfiguration config, string[] keys)
@@ -525,43 +524,107 @@ namespace NStore.Persistence.Mongo.Tests
                 : configuredWriters.ToString(CultureInfo.InvariantCulture);
         }
 
-        protected static List<PerfTestConfiguration> ReadConfiguredScenarios()
+        protected static MongoBatchInsertPerfSettings ReadPerformanceSettings()
         {
-            var config = GetTestConfiguration();
-            var scenarioSections = config.GetSection(PerformanceProfilesConfigPath).GetChildren().ToArray();
-            if (scenarioSections.Length == 0)
+            var settings = new MongoBatchInsertPerfSettings();
+            GetTestConfiguration().GetSection(PerformanceConfigPath).Bind(settings);
+
+            settings.ConnectionString = NormalizeConfiguredString(settings.ConnectionString);
+            settings.ScenarioFilter = NormalizeConfiguredString(settings.ScenarioFilter);
+            settings.SuiteLogFile = NormalizeConfiguredString(settings.SuiteLogFile);
+            settings.TestParameters ??= new List<MongoBatchInsertPerfScenarioSettings>();
+
+            if (settings.PartitionCount < 2)
+            {
+                throw new ArgumentOutOfRangeException(
+                    PartitionCountConfigKey,
+                    $"{PartitionCountConfigKey} must be >= 2, but was {settings.PartitionCount}.");
+            }
+
+            if (settings.DefaultTotalChunks < 0)
+            {
+                throw new ArgumentOutOfRangeException(
+                    DefaultTotalChunksConfigKey,
+                    $"{DefaultTotalChunksConfigKey} must be >= 0 (0 = no fallback), but was {settings.DefaultTotalChunks}.");
+            }
+
+            if (settings.WarmupBatches < 0)
+            {
+                throw new ArgumentOutOfRangeException(
+                    WarmupBatchesConfigKey,
+                    $"{WarmupBatchesConfigKey} must be >= 0, but was {settings.WarmupBatches}.");
+            }
+
+            if (settings.ProgressEveryBatches < 0)
+            {
+                throw new ArgumentOutOfRangeException(
+                    ProgressEveryBatchesConfigKey,
+                    $"{ProgressEveryBatchesConfigKey} must be >= 0 (0 = auto), but was {settings.ProgressEveryBatches}.");
+            }
+
+            if (settings.MaxDegradation < 0)
+            {
+                throw new ArgumentOutOfRangeException(
+                    MaxDegradationConfigKey,
+                    $"{MaxDegradationConfigKey} must be >= 0 (0 = disabled), but was {settings.MaxDegradation}.");
+            }
+
+            if (settings.ParallelBatchSize < 0)
+            {
+                throw new ArgumentOutOfRangeException(
+                    ParallelBatchSizeConfigKey,
+                    $"{ParallelBatchSizeConfigKey} must be >= 0 (0 = scenario batch size), but was {settings.ParallelBatchSize}.");
+            }
+
+            if (settings.ParallelWriters < 0)
+            {
+                throw new ArgumentOutOfRangeException(
+                    ParallelWritersConfigKey,
+                    $"{ParallelWritersConfigKey} must be >= 0 (0 = scenario/default writers), but was {settings.ParallelWriters}.");
+            }
+
+            return settings;
+        }
+
+        protected static List<PerfTestConfiguration> ReadConfiguredScenarios(MongoBatchInsertPerfSettings settings)
+        {
+            if (settings.TestParameters == null || settings.TestParameters.Count == 0)
             {
                 return new List<PerfTestConfiguration>();
             }
 
-            var scenarios = new List<PerfTestConfiguration>(scenarioSections.Length);
-            for (var i = 0; i < scenarioSections.Length; i++)
+            var scenarios = new List<PerfTestConfiguration>(settings.TestParameters.Count);
+            for (var i = 0; i < settings.TestParameters.Count; i++)
             {
-                var scenarioSection = scenarioSections[i];
-                var rawName = scenarioSection["Name"];
-                var name = string.IsNullOrWhiteSpace(rawName)
-                    ? $"scenario-{i + 1}"
-                    : rawName.Trim();
+                var configured = settings.TestParameters[i] ?? new MongoBatchInsertPerfScenarioSettings();
+                var scenarioKeyPath = $"{PerformanceProfilesConfigPath}:{i}";
+                var batchSize = GetRequiredInt(configured.BatchSize, $"{scenarioKeyPath}:BatchSize", 1);
+                var totalChunks = ResolveScenarioTotalChunks(
+                    configured.TotalChunks,
+                    settings.DefaultTotalChunks,
+                    $"{scenarioKeyPath}:TotalChunks");
+                var writers = ReadWritersFromConfiguration(configured.Writers, $"{scenarioKeyPath}:Writers");
+                var name = BuildScenarioName(totalChunks, batchSize, writers);
 
                 scenarios.Add(new PerfTestConfiguration
                 {
                     Name = name,
-                    BatchSize = ReadRequiredIntFromConfiguration(scenarioSection, "BatchSize", 1),
-                    Writers = ReadWritersFromConfiguration(scenarioSection, "Writers"),
-                    TotalChunks = ReadRequiredLongFromConfiguration(scenarioSection, "TotalChunks", 1)
+                    BatchSize = batchSize,
+                    Writers = writers,
+                    TotalChunks = totalChunks
                 });
             }
 
             return scenarios;
         }
 
-        private static int ReadWritersFromConfiguration(IConfigurationSection section, string key)
+        private static int ReadWritersFromConfiguration(string raw, string key)
         {
-            var raw = section[key];
+            raw = NormalizeConfiguredString(raw);
             if (string.IsNullOrWhiteSpace(raw))
             {
                 throw new ArgumentException(
-                    $"{section.Path}:{key} must be configured.");
+                    $"{key} must be configured.");
             }
 
             if (raw.Equals("unbounded", StringComparison.OrdinalIgnoreCase) ||
@@ -573,204 +636,80 @@ namespace NStore.Persistence.Mongo.Tests
             if (!int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value))
             {
                 throw new ArgumentException(
-                    $"{section.Path}:{key} must be an integer or 'unbounded', but was '{raw}'.");
+                    $"{key} must be an integer or 'unbounded', but was '{raw}'.");
             }
 
             if (value < 0)
             {
                 throw new ArgumentOutOfRangeException(
-                    $"{section.Path}:{key}",
-                    $"{section.Path}:{key} must be >= 0, but was {value}.");
+                    key,
+                    $"{key} must be >= 0, but was {value}.");
             }
 
             return value;
         }
 
-        private static int ReadRequiredIntFromConfiguration(
-            IConfigurationSection section,
-            string key,
-            int minValue)
+        private static int GetRequiredInt(int value, string key, int minValue)
         {
-            var raw = section[key];
-            if (string.IsNullOrWhiteSpace(raw))
-            {
-                throw new ArgumentException(
-                    $"{section.Path}:{key} must be configured.");
-            }
-
-            if (!int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value))
-            {
-                throw new ArgumentException(
-                    $"{section.Path}:{key} must be an integer value, but was '{raw}'.");
-            }
-
             if (value < minValue)
             {
                 throw new ArgumentOutOfRangeException(
-                    $"{section.Path}:{key}",
-                    $"{section.Path}:{key} must be >= {minValue}, but was {value}.");
+                    key,
+                    $"{key} must be >= {minValue}, but was {value}.");
             }
 
             return value;
         }
 
-        private static long ReadRequiredLongFromConfiguration(
-            IConfigurationSection section,
-            string key,
-            long minValue)
+        private static long ResolveScenarioTotalChunks(
+            long? scenarioTotalChunks,
+            long defaultTotalChunks,
+            string scenarioTotalChunksKey)
         {
-            var raw = section[key];
-            if (string.IsNullOrWhiteSpace(raw))
+            if (scenarioTotalChunks.HasValue)
             {
-                throw new ArgumentException(
-                    $"{section.Path}:{key} must be configured.");
+                return GetRequiredLong(scenarioTotalChunks.Value, scenarioTotalChunksKey, 1);
             }
 
-            if (!long.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value))
+            if (defaultTotalChunks > 0)
             {
-                throw new ArgumentException(
-                    $"{section.Path}:{key} must be an integer value, but was '{raw}'.");
-            }
-
-            if (value < minValue)
-            {
-                throw new ArgumentOutOfRangeException(
-                    $"{section.Path}:{key}",
-                    $"{section.Path}:{key} must be >= {minValue}, but was {value}.");
-            }
-
-            return value;
-        }
-
-        protected static int ReadIntSetting(string configKey, int fallback, int minValue)
-        {
-            var raw = ReadStringSetting(configKey);
-            if (string.IsNullOrWhiteSpace(raw))
-            {
-                return fallback;
-            }
-
-            if (!int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value))
-            {
-                throw new ArgumentException(
-                    $"{configKey} must be an integer value, but was '{raw}'.");
-            }
-
-            if (value < minValue)
-            {
-                throw new ArgumentOutOfRangeException(
-                    configKey,
-                    $"{configKey} must be >= {minValue}, but was {value}.");
-            }
-
-            return value;
-        }
-
-        protected static int? ReadOptionalIntSetting(string configKey, int minValue)
-        {
-            var raw = ReadStringSetting(configKey);
-            if (string.IsNullOrWhiteSpace(raw))
-            {
-                return null;
-            }
-
-            if (!int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value))
-            {
-                throw new ArgumentException(
-                    $"{configKey} must be an integer value, but was '{raw}'.");
-            }
-
-            if (value < minValue)
-            {
-                throw new ArgumentOutOfRangeException(
-                    configKey,
-                    $"{configKey} must be >= {minValue}, but was {value}.");
-            }
-
-            return value;
-        }
-
-        protected static double? ReadDoubleSetting(string configKey)
-        {
-            var raw = ReadStringSetting(configKey);
-            if (string.IsNullOrWhiteSpace(raw))
-            {
-                return null;
-            }
-
-            if (!double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
-            {
-                throw new ArgumentException(
-                    $"{configKey} must be a floating-point value, but was '{raw}'.");
-            }
-
-            if (value < 1.0)
-            {
-                throw new ArgumentOutOfRangeException(
-                    configKey,
-                    $"{configKey} must be >= 1.0 (1.0 = no degradation), but was {value}.");
-            }
-
-            return value;
-        }
-
-        protected static bool ReadBoolSetting(string configKey, bool fallback)
-        {
-            return ReadBoolSetting(GetTestConfiguration(), configKey, fallback);
-        }
-
-        protected static string ReadStringSetting(string configKey)
-        {
-            var raw = GetTestConfiguration()[configKey];
-            return string.IsNullOrWhiteSpace(raw)
-                ? null
-                : raw.Trim();
-        }
-
-        protected static bool IsEnabled(string value)
-        {
-            if (string.IsNullOrWhiteSpace(value))
-            {
-                return false;
-            }
-
-            return value == "1" ||
-                   value.Equals("true", StringComparison.OrdinalIgnoreCase) ||
-                   value.Equals("yes", StringComparison.OrdinalIgnoreCase);
-        }
-
-        private static bool IsDisabled(string value)
-        {
-            if (string.IsNullOrWhiteSpace(value))
-            {
-                return false;
-            }
-
-            return value == "0" ||
-                   value.Equals("false", StringComparison.OrdinalIgnoreCase) ||
-                   value.Equals("no", StringComparison.OrdinalIgnoreCase);
-        }
-
-        private static bool ReadBoolSetting(IConfiguration config, string configKey, bool fallback)
-        {
-            var raw = config[configKey];
-            if (string.IsNullOrWhiteSpace(raw))
-            {
-                return fallback;
-            }
-
-            if (IsEnabled(raw))
-            {
-                return true;
-            }
-
-            if (IsDisabled(raw))
-            {
-                return false;
+                return defaultTotalChunks;
             }
 
             throw new ArgumentException(
-                $"{configKey} must be a boolean value (supported: true/false, yes/no, 1/0), but was '{raw}'.");
+                $"{scenarioTotalChunksKey} is not configured. Set scenario TotalChunks or configure {DefaultTotalChunksConfigKey} with a value >= 1.");
+        }
+
+        private static string BuildScenarioName(long totalChunks, int batchSize, int writers)
+        {
+            return string.Format(
+                CultureInfo.InvariantCulture,
+                "chunks-{0}-batch-{1}-writers-{2}",
+                totalChunks,
+                batchSize,
+                FormatWriters(writers));
+        }
+
+        private static long GetRequiredLong(long value, string key, long minValue)
+        {
+            if (value < minValue)
+            {
+                throw new ArgumentOutOfRangeException(
+                    key,
+                    $"{key} must be >= {minValue}, but was {value}.");
+            }
+
+            return value;
+        }
+
+        private static string NormalizeConfiguredString(string raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                return string.Empty;
+            }
+
+            return raw.Trim();
         }
 
         protected sealed class PerfCsvWriter : IAsyncDisposable

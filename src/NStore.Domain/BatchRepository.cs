@@ -214,7 +214,8 @@ namespace NStore.Domain
             IReadOnlyList<IAggregate> aggregates,
             string operationId,
             Action<IHeadersAccessor> headers = null,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+            ParallelBatchAppendOptions parallelBatchAppendOptions = null)
         {
             if (!aggregates.Any())
             {
@@ -229,11 +230,13 @@ namespace NStore.Domain
 
             if (writeJobs.Count > 0)
             {
+                var writeJobsArray = writeJobs.ToArray();
+
                 // Step 2: Execute batch append
-                await _persistence.AppendBatchAsync(writeJobs.ToArray(), cancellationToken).ConfigureAwait(false);
+                await AppendWriteJobsAsync(writeJobsArray, parallelBatchAppendOptions, cancellationToken).ConfigureAwait(false);
                 var snapshotsToSave = new Dictionary<string, SnapshotInfo>();
 
-                foreach (var job in writeJobs)
+                foreach (var job in writeJobsArray)
                 {
                     var aggregate = aggregateByPartitionId[job.PartitionId];
                     listOfAggregateSaveResult.Add(MapJobResult(job, aggregate.Id));
@@ -269,6 +272,32 @@ namespace NStore.Domain
             {
                 Results = listOfAggregateSaveResult
             };
+        }
+
+        private Task AppendWriteJobsAsync(
+            WriteJob[] writeJobs,
+            ParallelBatchAppendOptions options,
+            CancellationToken cancellationToken)
+        {
+            if (options == null)
+            {
+                return _persistence.AppendBatchAsync(writeJobs, cancellationToken);
+            }
+
+            if (options.BatchSize <= 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(options.BatchSize), "BatchSize must be greater than zero.");
+            }
+
+            if (options.MaxWriters <= 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(options.MaxWriters), "MaxWriters must be greater than zero.");
+            }
+
+            var shouldUseParallelAppend = options.MaxWriters > 1 && writeJobs.Length > options.BatchSize;
+            return shouldUseParallelAppend
+                ? _persistence.AppendBatchAsync(writeJobs, options, cancellationToken)
+                : _persistence.AppendBatchAsync(writeJobs, cancellationToken);
         }
 
         private void PrepareAggregates(IEnumerable<IAggregate> aggregates, string operationId, Action<IHeadersAccessor> headers, List<WriteJob> writeJobs, Dictionary<string, IAggregate> aggregateByPartitionId, List<AggregateSaveResult> listOfAggregateSaveResult)

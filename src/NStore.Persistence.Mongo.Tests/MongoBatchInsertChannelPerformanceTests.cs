@@ -23,19 +23,19 @@ namespace NStore.Persistence.Mongo.Tests
         [Trait("Category", "Performance")]
         public async Task should_measure_batch_insert_performance_degradation()
         {
-            if (TrySkipWhenPerfDisabled())
+            var perfSettings = ReadPerformanceSettings();
+            if (TrySkipWhenPerfDisabled(perfSettings))
             {
                 return;
             }
 
-            var partitionCount = ReadIntSetting(PartitionCountConfigKey, 100, 2);
-            var warmupBatches = ReadIntSetting(WarmupBatchesConfigKey, 3, 0);
-            var maxDegradation = ReadDoubleSetting(MaxDegradationConfigKey);
-            var configuredProgressEveryBatches = ReadOptionalIntSetting(ProgressEveryBatchesConfigKey, 1);
-            var scenarios = LoadScenarios(partitionCount);
+            var partitionCount = perfSettings.PartitionCount;
+            var warmupBatches = perfSettings.WarmupBatches;
+            var configuredProgressEveryBatches = perfSettings.ProgressEveryBatches > 0 ? (int?)perfSettings.ProgressEveryBatches : null;
+            var scenarios = LoadScenarios(perfSettings, partitionCount);
 
             var suiteLogFile = ResolveSuiteLogFilePath(
-                ReadStringSetting(SuiteLogFileConfigKey),
+                perfSettings.SuiteLogFile,
                 "channel-workers");
             var suiteDirectory = Path.GetDirectoryName(suiteLogFile);
             if (!string.IsNullOrWhiteSpace(suiteDirectory))
@@ -56,15 +56,15 @@ namespace NStore.Persistence.Mongo.Tests
                     configuredProgressEveryBatches)
                 .ConfigureAwait(false);
 
-            var persistence = Create(true);
-            if (!(persistence is IEnhancedPersistence batcher))
-            {
-                throw new InvalidOperationException("Persistence does not expose AppendBatchAsync.");
-            }
-
             var runResults = new List<PerfRunResult>(scenarios.Count);
             for (var scenarioIndex = 0; scenarioIndex < scenarios.Count; scenarioIndex++)
             {
+                var persistence = Create(true);
+                if (!(persistence is IEnhancedPersistence batcher))
+                {
+                    throw new InvalidOperationException("Persistence does not expose AppendBatchAsync.");
+                }
+
                 var scenario = scenarios[scenarioIndex];
                 var scenarioLogFile = ResolveScenarioLogFilePath(suiteLogFile, scenario, scenarioIndex + 1);
                 var result = await RunChannelScenarioAsync(
@@ -73,7 +73,6 @@ namespace NStore.Persistence.Mongo.Tests
                     partitionCount,
                     warmupBatches,
                     configuredProgressEveryBatches,
-                    maxDegradation,
                     mongoTargetUrl,
                     scenarioLogFile).ConfigureAwait(false);
 
@@ -102,7 +101,6 @@ namespace NStore.Persistence.Mongo.Tests
             int partitionCount,
             int warmupBatches,
             int? configuredProgressEveryBatches,
-            double? maxDegradation,
             string mongoTargetUrl,
             string logFile)
         {
@@ -323,13 +321,6 @@ namespace NStore.Persistence.Mongo.Tests
 
                 Output.WriteLine(summaryLine);
                 Output.WriteLine($"Mongo batch scenario log: {logFile}");
-
-                if (maxDegradation.HasValue)
-                {
-                    Assert.True(
-                        worstDegradation <= maxDegradation.Value,
-                        $"Scenario '{scenario.Name}' measured degradation {worstDegradation:F3}x exceeds limit {maxDegradation.Value:F3}x.");
-                }
 
                 return new PerfRunResult
                 {

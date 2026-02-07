@@ -2,6 +2,7 @@ using NStore.Core.InMemory;
 using NStore.Core.Persistence;
 using NStore.Core.Snapshots;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
@@ -499,6 +500,8 @@ namespace NStore.Domain.Tests
             var saveSnapResult = await BatchRepository.SaveManyAsync(tickets.Values.ToList(), "save_snap").ConfigureAwait(false);
             Assert.NotNull(saveSnapResult);
 
+            await SnapshotBatchStore.DisposeAsync().ConfigureAwait(false);
+
             var snapshot1 = await _snapshotStore.GetAsync("Ticket_1", int.MaxValue).ConfigureAwait(false);
             var snapshot2 = await _snapshotStore.GetAsync("Ticket_2", int.MaxValue).ConfigureAwait(false);
 
@@ -519,6 +522,7 @@ namespace NStore.Domain.Tests
             tickets["Ticket_2"].Refund();
             var saveSnapResult2 = await BatchRepository.SaveManyAsync(tickets.Values.ToList(), "save_snap").ConfigureAwait(false);
             Assert.NotNull(saveSnapResult2);
+            await SnapshotBatchStore.DisposeAsync().ConfigureAwait(false);
 
             // Add more events
             await Persistence.AppendAsync("Ticket_1", 4, new Changeset(4, new object[] { new TicketSomethingHappened() }));
@@ -1060,6 +1064,8 @@ namespace NStore.Domain.Tests
             // Assert - partial failure
             Assert.False(result.Success);
 
+            await SnapshotBatchStore.DisposeAsync().ConfigureAwait(false);
+
             // Check snapshots - only Ticket_2 should have a snapshot from repo2
             // Note: repo1 also saved a snapshot for Ticket_1 at version 2
             var snap1 = await _snapshotStore.GetAsync("Ticket_1", int.MaxValue).ConfigureAwait(false);
@@ -1156,6 +1162,103 @@ namespace NStore.Domain.Tests
             Assert.Same(first["Ticket_1"], second["Ticket_1"]); // Cached
             Assert.NotNull(second["Ticket_2"]); // Newly loaded
             Assert.Equal(1, second["Ticket_2"].Version);
+        }
+    }
+
+    public class batch_repository_parallel_append : BaseBatchRepositoryTest
+    {
+        private readonly TrackingEnhancedPersistence _trackingPersistence = new TrackingEnhancedPersistence();
+
+        protected override IPersistence CreatePersistence()
+        {
+            return _trackingPersistence;
+        }
+
+        [Fact]
+        public async Task SaveManyAsync_should_use_single_append_call_when_parallel_batch_options_are_not_configured()
+        {
+            var repository = (BatchRepository)BatchRepository;
+            var aggregates = CreateChangedTickets(10);
+
+            var result = await repository.SaveManyAsync(aggregates, "single_call").ConfigureAwait(false);
+
+            Assert.True(result.Success);
+            Assert.Equal(1, _trackingPersistence.AppendBatchCallCount);
+            Assert.Equal(new[] { 10 }, _trackingPersistence.ObservedBatchSizes.OrderBy(x => x).ToArray());
+        }
+
+        [Fact]
+        public async Task SaveManyAsync_should_use_single_append_call_when_batch_does_not_exceed_configured_batch_size()
+        {
+            var repository = (BatchRepository)BatchRepository;
+            var options = new ParallelBatchAppendOptions
+            {
+                BatchSize = 10,
+                MaxWriters = 4
+            };
+
+            var aggregates = CreateChangedTickets(10);
+            var result = await repository
+                .SaveManyAsync(aggregates, "no_split", parallelBatchAppendOptions: options)
+                .ConfigureAwait(false);
+
+            Assert.True(result.Success);
+            Assert.Equal(1, _trackingPersistence.AppendBatchCallCount);
+            Assert.Equal(new[] { 10 }, _trackingPersistence.ObservedBatchSizes.OrderBy(x => x).ToArray());
+        }
+
+        [Fact]
+        public async Task SaveManyAsync_should_split_batches_when_parallel_batch_options_are_configured()
+        {
+            var repository = (BatchRepository)BatchRepository;
+            var options = new ParallelBatchAppendOptions
+            {
+                BatchSize = 3,
+                MaxWriters = 2
+            };
+
+            var aggregates = CreateChangedTickets(10);
+            var result = await repository
+                .SaveManyAsync(aggregates, "split_call", parallelBatchAppendOptions: options)
+                .ConfigureAwait(false);
+
+            Assert.True(result.Success);
+            Assert.Equal(4, _trackingPersistence.AppendBatchCallCount);
+            Assert.Equal(new[] { 1, 3, 3, 3 }, _trackingPersistence.ObservedBatchSizes.OrderBy(x => x).ToArray());
+        }
+
+        private static IReadOnlyList<IAggregate> CreateChangedTickets(int count)
+        {
+            var aggregates = new List<IAggregate>(count);
+            for (var i = 0; i < count; i++)
+            {
+                var ticket = Ticket.CreateNew($"Parallel_{i}");
+                ticket.Sale();
+                aggregates.Add(ticket);
+            }
+
+            return aggregates;
+        }
+
+        private sealed class TrackingEnhancedPersistence : NullPersistence, IEnhancedPersistence
+        {
+            private int _appendBatchCallCount;
+
+            public int AppendBatchCallCount => Volatile.Read(ref _appendBatchCallCount);
+            public ConcurrentBag<int> ObservedBatchSizes { get; } = new ConcurrentBag<int>();
+
+            public Task AppendBatchAsync(WriteJob[] queue, CancellationToken cancellationToken)
+            {
+                Interlocked.Increment(ref _appendBatchCallCount);
+                ObservedBatchSizes.Add(queue.Length);
+
+                foreach (var writeJob in queue)
+                {
+                    writeJob.Succeeded();
+                }
+
+                return Task.CompletedTask;
+            }
         }
     }
 }
