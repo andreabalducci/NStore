@@ -2,7 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using NStore.Core.Persistence;
 using Xunit;
@@ -11,22 +13,21 @@ using Xunit.Abstractions;
 namespace NStore.Persistence.Mongo.Tests
 {
     // ReSharper disable once InconsistentNaming
-    public class mongodb_parallel_extension_batch_insert_performance_tests : MongoBatchInsertPerformanceTestBase
+    public class mongodb_batch_insert_performance_tests : MongoBatchInsertPerformanceTestBase
     {
-        public mongodb_parallel_extension_batch_insert_performance_tests(ITestOutputHelper output) : base(output)
+        public mongodb_batch_insert_performance_tests(ITestOutputHelper output) : base(output)
         {
         }
 
         [Fact]
         [Trait("Category", "Performance")]
-        public async Task should_measure_parallel_extension_batch_insert_performance_degradation()
+        public async Task should_measure_batch_insert_performance_degradation()
         {
             if (TrySkipWhenPerfDisabled())
             {
                 return;
             }
 
-            var parallelOptions = ReadParallelOptionsFromConfiguration();
             var partitionCount = ReadIntSetting(PartitionCountConfigKey, 100, 2);
             var warmupBatches = ReadIntSetting(WarmupBatchesConfigKey, 3, 0);
             var maxDegradation = ReadDoubleSetting(MaxDegradationConfigKey);
@@ -35,7 +36,7 @@ namespace NStore.Persistence.Mongo.Tests
 
             var suiteLogFile = ResolveSuiteLogFilePath(
                 ReadStringSetting(SuiteLogFileConfigKey),
-                "extension-method");
+                "channel-workers");
             var suiteDirectory = Path.GetDirectoryName(suiteLogFile);
             if (!string.IsNullOrWhiteSpace(suiteDirectory))
             {
@@ -48,7 +49,7 @@ namespace NStore.Persistence.Mongo.Tests
             await using var suiteWriter = await PerfCsvWriter.CreateSuiteAsync(
                     suiteLogFile,
                     mongoTargetUrl,
-                    "extension-method",
+                    "channel-workers",
                     scenarios.Count,
                     partitionCount,
                     warmupBatches,
@@ -66,7 +67,7 @@ namespace NStore.Persistence.Mongo.Tests
             {
                 var scenario = scenarios[scenarioIndex];
                 var scenarioLogFile = ResolveScenarioLogFilePath(suiteLogFile, scenario, scenarioIndex + 1);
-                var result = await RunExtensionScenarioAsync(
+                var result = await RunChannelScenarioAsync(
                     batcher,
                     scenario,
                     partitionCount,
@@ -74,8 +75,7 @@ namespace NStore.Persistence.Mongo.Tests
                     configuredProgressEveryBatches,
                     maxDegradation,
                     mongoTargetUrl,
-                    scenarioLogFile,
-                    parallelOptions).ConfigureAwait(false);
+                    scenarioLogFile).ConfigureAwait(false);
 
                 runResults.Add(result);
                 var suiteLine = await suiteWriter.WriteSuiteResultAsync(result).ConfigureAwait(false);
@@ -96,7 +96,7 @@ namespace NStore.Persistence.Mongo.Tests
             Output.WriteLine(summaryLine);
         }
 
-        private async Task<PerfRunResult> RunExtensionScenarioAsync(
+        private async Task<PerfRunResult> RunChannelScenarioAsync(
             IEnhancedPersistence batcher,
             PerfTestConfiguration scenario,
             int partitionCount,
@@ -104,35 +104,19 @@ namespace NStore.Persistence.Mongo.Tests
             int? configuredProgressEveryBatches,
             double? maxDegradation,
             string mongoTargetUrl,
-            string logFile,
-            ParallelBatchAppendOptions parallelOptions)
+            string logFile)
         {
-            var configuredWriterCount = ResolveEffectiveWriterCount(
+            var totalBatches = CalculateTotalBatches(scenario);
+
+            var effectiveWriterCount = ResolveEffectiveWriterCount(
                 scenario.Writers,
-                CalculateTotalBatches(scenario),
+                totalBatches,
                 partitionCount);
 
-            var resolvedParallelOptions = new ParallelBatchAppendOptions
-            {
-                BatchSize = parallelOptions.BatchSize > 0 ? parallelOptions.BatchSize : scenario.BatchSize,
-                MaxWriters = parallelOptions.MaxWriters > 0 ? parallelOptions.MaxWriters : configuredWriterCount
-            };
-
-            if (scenario.TotalChunks > int.MaxValue)
-            {
-                throw new ArgumentOutOfRangeException(
-                    nameof(scenario.TotalChunks),
-                    $"Scenario '{scenario.Name}' requires {scenario.TotalChunks} jobs, which exceeds the maximum supported queue size ({int.MaxValue}).");
-            }
-
-            var totalBatches = (scenario.TotalChunks + resolvedParallelOptions.BatchSize - 1) /
-                               resolvedParallelOptions.BatchSize;
-            var effectiveWriterCount = resolvedParallelOptions.MaxWriters;
             var progressEveryBatches = ResolveProgressEveryBatches(configuredProgressEveryBatches, totalBatches);
             var representativePayloadSizeBytes = EstimatePayloadSizeBytes(
                 CreateComplexPayload(1, "perf-stream-0000", 1));
-            var appendModeLabel =
-                $"extension-method(batch_size={resolvedParallelOptions.BatchSize},max_writers={resolvedParallelOptions.MaxWriters})";
+            var appendModeLabel = $"channel-workers(effective_writers={effectiveWriterCount})";
 
             await using var writer = await PerfCsvWriter.CreateScenarioAsync(
                     logFile,
@@ -156,25 +140,22 @@ namespace NStore.Persistence.Mongo.Tests
                 mongoTargetUrl,
                 logFile);
 
+            CancellationTokenSource workerCancellation = null;
+            Task workersCompletionTask = Task.CompletedTask;
+            try
             {
-                var singleWriterState = new WriterPartitionState(0, partitionCount);
+                var writerStates = CreateWriterStates(effectiveWriterCount, partitionCount);
+
                 long nextId = 0;
                 long warmupInserted = 0;
-                var warmupTotalChunks = (long)warmupBatches * scenario.BatchSize;
-                if (warmupTotalChunks > int.MaxValue)
+                for (var i = 0; i < warmupBatches; i++)
                 {
-                    throw new ArgumentOutOfRangeException(
-                        nameof(warmupBatches),
-                        $"Warmup for scenario '{scenario.Name}' requires {warmupTotalChunks} jobs, which exceeds the maximum supported queue size ({int.MaxValue}).");
-                }
+                    var writerState = writerStates[i % writerStates.Length];
+                    var warmupJobs = CreateJobs(nextId, scenario.BatchSize, writerState);
+                    nextId += scenario.BatchSize;
+                    warmupInserted += scenario.BatchSize;
 
-                if (warmupTotalChunks > 0)
-                {
-                    var warmupJobs = CreateJobs(nextId, (int)warmupTotalChunks, singleWriterState);
-                    nextId += warmupTotalChunks;
-                    warmupInserted += warmupTotalChunks;
-
-                    await batcher.AppendBatchAsync(warmupJobs, resolvedParallelOptions, CancellationToken.None).ConfigureAwait(false);
+                    await batcher.AppendBatchAsync(warmupJobs, CancellationToken.None).ConfigureAwait(false);
                     Assert.All(warmupJobs, job => Assert.Equal(WriteJob.WriteResult.Committed, job.Result));
                 }
 
@@ -255,17 +236,76 @@ namespace NStore.Persistence.Mongo.Tests
                     windowStopwatch.Restart();
                 }
 
-                var jobs = CreateJobs(nextId, (int)scenario.TotalChunks, singleWriterState);
-                var batchStopwatch = Stopwatch.StartNew();
-                await batcher.AppendBatchAsync(jobs, resolvedParallelOptions, CancellationToken.None).ConfigureAwait(false);
-                batchStopwatch.Stop();
-                Assert.All(jobs, job => Assert.Equal(WriteJob.WriteResult.Committed, job.Result));
+                var batchResults = Channel.CreateUnbounded<BatchExecutionResult>(new UnboundedChannelOptions
+                {
+                    SingleReader = true,
+                    SingleWriter = false,
+                    AllowSynchronousContinuations = false
+                });
 
-                await ProcessBatchResultAsync(
-                        new BatchExecutionResult(
-                            jobs.Length,
-                            batchStopwatch.Elapsed.TotalMilliseconds))
-                    .ConfigureAwait(false);
+                var nextPayloadId = nextId;
+                workerCancellation = new CancellationTokenSource();
+                var workerCancellationToken = workerCancellation.Token;
+
+                long nextBatchNumber = 0;
+                var workerTasks = writerStates
+                    .Select(writerState =>
+                        Task.Run(async () =>
+                        {
+                            while (!workerCancellationToken.IsCancellationRequested)
+                            {
+                                var batchNumber = Interlocked.Increment(ref nextBatchNumber);
+                                if (batchNumber > totalBatches)
+                                {
+                                    break;
+                                }
+
+                                var remainingForBatch = scenario.TotalChunks - (long)(batchNumber - 1) * scenario.BatchSize;
+                                var currentBatchSize = (int)Math.Min(remainingForBatch, scenario.BatchSize);
+                                var startId = Interlocked.Add(ref nextPayloadId, currentBatchSize) - currentBatchSize;
+                                var jobs = CreateJobs(startId, currentBatchSize, writerState);
+
+                                var batchStopwatch = Stopwatch.StartNew();
+                                await batcher.AppendBatchAsync(jobs, workerCancellationToken).ConfigureAwait(false);
+                                batchStopwatch.Stop();
+                                Assert.All(jobs, job => Assert.Equal(WriteJob.WriteResult.Committed, job.Result));
+
+                                await batchResults.Writer.WriteAsync(
+                                        new BatchExecutionResult(
+                                            currentBatchSize,
+                                            batchStopwatch.Elapsed.TotalMilliseconds),
+                                        workerCancellationToken)
+                                    .ConfigureAwait(false);
+                            }
+                        }, workerCancellationToken))
+                    .ToArray();
+
+                workersCompletionTask = Task.Run(async () =>
+                {
+                    Exception completionError = null;
+                    try
+                    {
+                        await Task.WhenAll(workerTasks).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        if (!IsCancellationException(ex) || !workerCancellationToken.IsCancellationRequested)
+                        {
+                            completionError = ex;
+                        }
+                    }
+                    finally
+                    {
+                        batchResults.Writer.TryComplete(completionError);
+                    }
+                });
+
+                await foreach (var result in batchResults.Reader.ReadAllAsync().ConfigureAwait(false))
+                {
+                    await ProcessBatchResultAsync(result).ConfigureAwait(false);
+                }
+
+                await workersCompletionTask.ConfigureAwait(false);
 
                 totalStopwatch.Stop();
                 var medianSingleBatchMs = overallDurationSamples.Count == 0
@@ -308,6 +348,28 @@ namespace NStore.Persistence.Mongo.Tests
                     WorstDegradation = worstDegradation,
                     ScenarioLogFile = logFile
                 };
+            }
+            finally
+            {
+                if (workerCancellation != null)
+                {
+                    workerCancellation.Cancel();
+                }
+
+                // Give workers a bounded window to finish after cancellation;
+                // avoids hanging the test host if a MongoDB operation ignores the token.
+                var completed = await Task.WhenAny(
+                    workersCompletionTask,
+                    Task.Delay(TimeSpan.FromSeconds(WorkerShutdownTimeoutSeconds))
+                ).ConfigureAwait(false);
+
+                if (completed != workersCompletionTask)
+                {
+                    Output.WriteLine(
+                        $"Warning: worker tasks did not complete within {WorkerShutdownTimeoutSeconds}s after cancellation.");
+                }
+
+                workerCancellation?.Dispose();
             }
         }
     }
