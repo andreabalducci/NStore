@@ -153,7 +153,7 @@ Then run the perf test command.
 - `NStore:Mongo:Performance:DefaultTotalChunks` (long, optional fallback for scenario `TotalChunks`)
 - `NStore:Mongo:Performance:WarmupBatches` (int, default `3`)
 - `NStore:Mongo:Performance:ProgressEveryBatches` (int, optional)
-- `NStore:Mongo:Performance:MaxDegradation` (double, optional, `>= 1.0`)
+- `NStore:Mongo:Performance:MaxDegradation` (double, optional, informational only; does not fail tests)
 - `NStore:Mongo:Performance:ParallelBatchSize` (int, optional) parallel extension mode only
 - `NStore:Mongo:Performance:ParallelWriters` (int, optional) parallel extension mode only
 

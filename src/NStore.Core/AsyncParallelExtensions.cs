@@ -27,27 +27,34 @@ namespace NStore.Core
             Func<T, CancellationToken, Task> body,
             CancellationToken cancellationToken)
         {
-            using var throttler = new SemaphoreSlim(maxDegreeOfParallelism);
+            var throttler = new SemaphoreSlim(maxDegreeOfParallelism);
             var tasks = new List<Task>();
-
-            foreach (var item in source)
-            {
-                await throttler.WaitAsync(cancellationToken).ConfigureAwait(false);
-
-                tasks.Add(Task.Run(async () =>
-                {
-                    try
-                    {
-                        await body(item, cancellationToken).ConfigureAwait(false);
-                    }
-                    finally
-                    {
-                        throttler.Release();
-                    }
-                }, cancellationToken));
-            }
-
             List<Exception> exceptions = null;
+            OperationCanceledException cancellation = null;
+
+            try
+            {
+                foreach (var item in source)
+                {
+                    await throttler.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+                    tasks.Add(Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await body(item, cancellationToken).ConfigureAwait(false);
+                        }
+                        finally
+                        {
+                            throttler.Release();
+                        }
+                    }));
+                }
+            }
+            catch (OperationCanceledException ex)
+            {
+                cancellation = ex;
+            }
 
             while (tasks.Count > 0)
             {
@@ -58,9 +65,9 @@ namespace NStore.Core
                 {
                     await completed.ConfigureAwait(false);
                 }
-                catch (OperationCanceledException)
+                catch (OperationCanceledException ex)
                 {
-                    throw;
+                    cancellation ??= ex;
                 }
                 catch (Exception ex)
                 {
@@ -69,9 +76,16 @@ namespace NStore.Core
                 }
             }
 
+            throttler.Dispose();
+
             if (exceptions != null)
             {
                 throw new AggregateException(exceptions);
+            }
+
+            if (cancellation != null)
+            {
+                throw cancellation;
             }
         }
     }
