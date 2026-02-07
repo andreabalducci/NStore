@@ -73,7 +73,8 @@ run_single_perf_test() {
   local started_at
   started_at="$(date +%s)"
 
-  dotnet test "$PROJECT_PATH" \
+  NStore__Mongo__Performance__Enabled=true \
+    dotnet test "$PROJECT_PATH" \
     -c "$CONFIGURATION" \
     -f "$TARGET_FRAMEWORK" \
     --disable-build-servers \
@@ -84,7 +85,7 @@ run_single_perf_test() {
   suite_file="$(latest_suite_file "$suite_prefix")"
   if [ -z "$suite_file" ] || [ "$(file_mtime_epoch "$suite_file")" -lt "$started_at" ]; then
     echo "No suite.csv produced for $mode." >&2
-    echo "Ensure perf mode is enabled in appsettings: NStore:Mongo:Performance:Enabled=true." >&2
+    echo "Perf mode should be enabled by script via NStore__Mongo__Performance__Enabled=true." >&2
     exit 1
   fi
 
