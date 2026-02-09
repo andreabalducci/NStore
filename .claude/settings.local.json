@@ -3,7 +3,37 @@
     "allow": [
       "Bash(dotnet test:*)",
       "Bash(dotnet build:*)",
-      "Bash(gh api:*)"
+      "Bash(gh api:*)",
+      "Bash(gh issue list:*)",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nAdd code review report for MongoDB batch insert performance tests\n\nDocuments 10 findings including 2 correctness bugs \\(worker disposal race,\nmaxDegradation validation\\), 1 data-loss risk \\(unflushed scenario log\\),\nand misleading CSV output for unbounded writer scenarios.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git push:*)",
+      "Bash(gh pr create:*)",
+      "WebSearch",
+      "WebFetch(domain:mcr.microsoft.com)",
+      "Bash(docker pull:*)",
+      "Bash(docker run:*)",
+      "Bash(docker ps:*)",
+      "Bash(NSTORE_MSSQL=\"Server=localhost,1433;Database=NStore;User Id=sa;Password=YourStrong!Passw0rd;TrustServerCertificate=True\" dotnet test:*)",
+      "Bash(docker exec:*)",
+      "Bash(docker stop:*)",
+      "Bash(docker rm:*)",
+      "Bash(NSTORE_MSSQL='Server=localhost,1433;Database=NStore;User Id=sa;Password=YourStrong!Passw0rd;TrustServerCertificate=True' dotnet test:*)",
+      "Bash(git status:*)",
+      "Bash(gh pr list:*)",
+      "Bash(git commit:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr edit:*)",
+      "Bash(NSTORE_MONGO_BATCH_PERF=1 NSTORE_MONGO_BATCH_PERF_TOTAL_CHUNKS=1000 dotnet test:*)",
+      "Bash(for i in 1 2 3)",
+      "Bash(do echo \"=== Run $i ===\")",
+      "Bash(done)",
+      "Bash(NSTORE_MONGO_BATCH_PERF=1 NSTORE_MONGO_BATCH_PERF_TOTAL_CHUNKS=2000 dotnet test:*)",
+      "Bash(NSTORE_MONGO_BATCH_PERF=1 dotnet test:*)",
+      "Bash(dotnet user-secrets:*)",
+      "Bash(NSTORE_MONGO_BATCH_PERF=1 NSTORE_MONGODB='mongodb+srv://tonystark:gJeekNNNQAxbreb5@jarvis-labs.yvlzo.mongodb.net/nstoredev?authSource=admin&w=majority&journal=true&wtimeoutMS=30000' dotnet test:*)",
+      "Bash(ls:*)"
     ]
   }
 }
