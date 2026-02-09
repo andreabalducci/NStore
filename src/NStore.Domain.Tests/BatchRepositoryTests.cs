@@ -500,6 +500,8 @@ namespace NStore.Domain.Tests
             var saveSnapResult = await BatchRepository.SaveManyAsync(tickets.Values.ToList(), "save_snap").ConfigureAwait(false);
             Assert.NotNull(saveSnapResult);
 
+            await SnapshotBatchStore.DisposeAsync().ConfigureAwait(false);
+
             var snapshot1 = await _snapshotStore.GetAsync("Ticket_1", int.MaxValue).ConfigureAwait(false);
             var snapshot2 = await _snapshotStore.GetAsync("Ticket_2", int.MaxValue).ConfigureAwait(false);
 
@@ -520,6 +522,7 @@ namespace NStore.Domain.Tests
             tickets["Ticket_2"].Refund();
             var saveSnapResult2 = await BatchRepository.SaveManyAsync(tickets.Values.ToList(), "save_snap").ConfigureAwait(false);
             Assert.NotNull(saveSnapResult2);
+            await SnapshotBatchStore.DisposeAsync().ConfigureAwait(false);
 
             // Add more events
             await Persistence.AppendAsync("Ticket_1", 4, new Changeset(4, new object[] { new TicketSomethingHappened() }));
@@ -1060,6 +1063,8 @@ namespace NStore.Domain.Tests
 
             // Assert - partial failure
             Assert.False(result.Success);
+
+            await SnapshotBatchStore.DisposeAsync().ConfigureAwait(false);
 
             // Check snapshots - only Ticket_2 should have a snapshot from repo2
             // Note: repo1 also saved a snapshot for Ticket_1 at version 2
